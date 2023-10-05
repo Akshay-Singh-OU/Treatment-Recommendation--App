@@ -1,0 +1,65 @@
+if (!require(shiny))
+ {
+  install.packages("shiny")
+}
+library(shiny)
+
+# Define UI
+ui <- fluidPage(
+  titlePanel("Medical Treatment Recommendation App"),
+  sidebarLayout(
+    sidebarPanel(
+      textInput("diagnosisInput", "Diagnosis:"),
+      numericInput("ageInput", "Age:"),
+      selectInput("genderInput", "Gender:", c("Male", "Female")),
+      textAreaInput("medicalHistoryInput", "Medical History:"),
+      actionButton("recommendBtn", "Recommend Treatment")
+    ),
+    mainPanel(
+      h3("Treatment Recommendations:"),
+      verbatimTextOutput("recommendationText")
+    )
+  )
+)
+
+# Define Server
+server <- function(input, output) {
+  output$recommendationText <- renderText({
+    if (input$recommendBtn > 0) {
+      diagnosis <- input$diagnosisInput
+      age <- input$ageInput
+      gender <- input$genderInput
+      medical_history <- input$medicalHistoryInput
+
+      # Query the treatment recommendation based on the diagnosis
+      recommendation <- getTreatmentRecommendation(diagnosis)
+
+      # Include medical history in the recommendation
+      recommendation <- paste(recommendation, "Medical History:", medical_history)
+
+      return(recommendation)
+    }
+  })
+}
+
+# Function to retrieve treatment recommendations based on diagnosis
+getTreatmentRecommendation <- function(diagnosis) {
+  # Add your code here to fetch treatment recommendations based on the diagnosis
+  # This could involve querying a medical knowledge base or database
+
+  # For example, let's assume we have a list of treatment recommendations for certain diagnoses
+  treatment_options <- list(
+    "Common Cold" = c("Rest, drink fluids, use over-the-counter pain relievers, and consider using decongestants or cough suppressants as directed."),
+    "Influenza (Flu)" = c("Rest, drink fluids, use over-the-counter pain relievers, and consider antiviral medications as prescribed by a healthcare provider."),
+    "Gastroenteritis (Stomach Flu)" = c("Stay hydrated, follow the BRAT diet (bananas, rice, applesauce, toast), avoid solid foods initially, and consider over-the-counter medications for symptom relief."),
+    "Allergies" = c("Avoid triggers, use over-the-counter antihistamines, nasal sprays, or eye drops for symptom relief. In severe cases, consult a healthcare provider for prescription medications or allergy shots."),
+    "Asthma" = c("Follow an asthma action plan provided by a healthcare provider, use inhalers as prescribed (such as bronchodilators and corticosteroids), and avoid triggers.")
+  )
+
+  # Randomly select a treatment recommendation from the list
+  random_index <- sample(length(treatment_options[[diagnosis]]), 1)
+  return(treatment_options[[diagnosis]][random_index])
+}
+
+# Run the app
+shinyApp(ui = ui, server = server
