@@ -1,0 +1,179 @@
+> install.packages("shiny")
+The following package(s) will be installed:
+- shiny [1.7.5]
+These packages will be installed into "~/Recommender App/renv/library/R-4.3/x86_64-w64-mingw32".
+
+Do you want to proceed? [Y/n]: Y
+
+# Installing packages ------------------------------------------------
+- Installing shiny ...                          OK [linked from cache]
+Successfully installed 1 package in 21 milliseconds.
+> install.packages("plotly")
+The following package(s) will be installed:
+- plotly [4.10.2]
+These packages will be installed into "~/Recommender App/renv/library/R-4.3/x86_64-w64-mingw32".
+
+Do you want to proceed? [Y/n]: Y
+
+# Installing packages ------------------------------------------------
+- Installing plotly ...                         OK [linked from cache]
+Successfully installed 1 package in 22 milliseconds.
+> library(shiny)
+> library(plotly)
+> 
+> # Sample healthcare dataset with age, medical history, diagnoses, severity, effectiveness, and survival rates
+> set.seed(123)
+> n_patients <- 100
+> age <- sample(20:80, n_patients, replace = TRUE)
+> medical_history <- sample(c("None", "Heart Disease", "Diabetes", "Asthma"), n_patients, replace = TRUE)
+> diagnoses <- sample(c("Common Cold", "Influenza (Flu)", "Strep Throat", "Allergic Rhinitis", "Tension Headache"), n_patients, replace = TRUE)
+> severity <- sample(1:5, n_patients, replace = TRUE)
+> effectiveness <- sample(1:5, n_patients, replace = TRUE)
+> 
+> # Rule-based treatment recommendations (simplified)
+> recommend_treatment <- function(diagnosis, severity, effectiveness) 
+  {
++     if (diagnosis == "Common Cold" && severity < 3) 
+      {
++         if (effectiveness >= 3) 
+          {
++             return("Rest and drink fluids")
++         } 
+          else 
+          {
++             return("Take over-the-counter medication")
++         }
++     }
+          else if (diagnosis == "Influenza (Flu)" && severity < 4) 
+          {
++             if (effectiveness >= 3) 
+              {
++             return("Take antiviral medication, Get plenty of rest")
++         } 
+              else 
+              {
++             return("Consult a doctor for further evaluation")
++         }
++         } 
+              else if (diagnosis == "Strep Throat" && severity < 3) 
+              {
++               if (effectiveness >= 3)
+                {
++                   return("Take antibiotics, Gargle warm saltwater")
++               } 
+                else 
+                {
++                   return("Consult a doctor for alternative treatment")
++               }
++     }
+              else 
+              {
++                  return("Consult a doctor for personalized treatment")
++             }
++ }
+> calculate_survival_rate <- function(age, medical_history) {
++     base_rate <- 0.9
++     
++     # Adjust survival rate based on medical history
++     if (medical_history == "Heart Disease") 
+      {
++         base_rate <- base_rate * 0.6
++     } 
+      else if (medical_history == "Diabetes")
+      {
++         base_rate <- base_rate * 0.7
++     } 
+      else if (medical_history == "Asthma")
+      {
++         base_rate <- base_rate * 0.8
++     }
++     
++     # Adjust survival rate based on age
++     if (age > 60) 
+      {
++         base_rate <- base_rate * 0.85
++     }
++     
++     return(base_rate)
++ }
+> 
+> # Define the user interface with a customized title
+> ui <- fluidPage(
++     titlePanel("Akshay Singh's Healthcare Decision Support System"),
++     sidebarLayout(
++         sidebarPanel(
++             selectInput("diagnosis", "Select Diagnosis:", choices = c("Common Cold", "Influenza (Flu)", "Strep Throat")),
++             sliderInput("severity", "Select Severity (1-5):", min = 1, max = 5, value = 3),
++             sliderInput("effectiveness", "Select Effectiveness (1-5):", min = 1, max = 5, value = 3),
++             selectInput("medical_history", "Select Medical History:", choices = c("None", "Heart Disease", "Diabetes", "Asthma")),
++             actionButton("recommend_btn", "Get Recommendation", class = "btn-primary"),
++             h4("Estimated Survival Rate:")
++         ),
++         mainPanel(
++             h3("Recommendation:"),
++             verbatimTextOutput("recommendation_output"),
++             plotlyOutput("survival_rate_plot"),
++             plotOutput("severity_effectiveness_plot")
++         )
++     )
++ )
+> 
+> # Define the server logic
+> server <- function(input, output) {
++     recommended_treatment <- eventReactive(input$recommend_btn, {
++         diagnosis <- input$diagnosis
++         severity <- input$severity
++         effectiveness <- input$effectiveness
++         medical_history <- input$medical_history
++         treatment <- recommend_treatment(diagnosis, severity, effectiveness)
++         rate <- calculate_survival_rate(sample(20:80, 1), medical_history)  # Sample age for simplicity
++         return(list(treatment = treatment, rate = rate))
++     })
++     
++ output$recommendation_output <- renderText({
++     recommended_treatment()$treatment
++ })
++ 
++ output$survival_rate_plot <- renderPlotly({
++     rate <- recommended_treatment()$rate
++     
++     
++ # Create a pie chart for survival rate
++ data <- data.frame(Category = c("Survival", "Non-Survival"), Rate = c(rate, 1 - rate))
++ colors <- c("#00cc00", "#ff0000")
++ 
++ pie_chart <- plot_ly(data, labels = ~Category, values = ~Rate, type = "pie", 
++                      marker = list(colors = colors), textinfo = "label+percent")
++ 
++ pie_chart <- pie_chart %>%
++     layout(title = "Estimated Survival Rate",
++            showlegend = FALSE,
++            annotations = list(text = paste0("Rate: ", scales::percent(rate)),
++                               x = 0.5, y = 0.5, showarrow = FALSE))
++ 
++ pie_chart
++ })
++ 
++ 
++ output$severity_effectiveness_plot <- renderPlot({
++     severity <- input$severity
++     effectiveness <- input$effectiveness
++     
++     # Create a bar graph for severity and effectiveness
++     data <- data.frame(Measure = c("Severity", "Effectiveness"), Value = c(severity, effectiveness))
++     
++     gg <- ggplot(data, aes(x = Measure, y = Value, fill = Measure)) +
++         geom_bar(stat = "identity", width = 0.5) +
++         labs(x = NULL, y = "Value") +
++         theme_minimal() +
++         theme(
++             axis.text.x = element_text(angle = 45, hjust = 1),
++             plot.title = element_text(hjust = 0.5)
++         ) +
++         ggtitle("Severity and Effectiveness")
++     
++     print(gg)
++ })
++ }
+> 
+> shinyApp(ui = ui, server = server)
