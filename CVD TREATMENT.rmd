@@ -1,0 +1,1307 @@
+library(shiny)
+library(shinythemes)
+library(caret)
+library(DT)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(jsonlite)
+library(httr)
+library(ggplot2)
+library(sentimentr)
+library(syuzhet)
+library(rmarkdown)
+library(shinyjs)
+
+# Generate Content Function 
+generateContent <- function(prompt, api_key, model_endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent") {
+  headers <- c(`Content-Type` = "application/json")
+  params <- list(`key` = api_key)
+  payload <- list(contents = list(list(parts = list(list(text = as.character(prompt)))))) 
+  body_json <- jsonlite::toJSON(payload, auto_unbox = TRUE)
+  
+  res <- tryCatch(
+    httr::POST(
+      url = model_endpoint,
+      httr::add_headers(.headers = headers),
+      query = params,
+      body = body_json,
+      encode = "raw",
+      timeout(30)
+    ),
+    error = function(e) e
+  )
+  
+  if (inherits(res, "error")) {
+    return(list(ok=FALSE, status=NA, text=paste0("Network error: ", res$message)))
+  }
+  
+  status <- httr::status_code(res)
+  raw_text <- tryCatch(httr::content(res, as = "text", encoding = "UTF-8"), error=function(e) NA_character_)
+  
+  if (status == 200) {
+    parsed <- tryCatch(jsonlite::fromJSON(raw_text, simplifyVector=FALSE), error=function(e) NULL)
+    generated_text <- NULL
+    if (!is.null(parsed)) {
+      if (!is.null(parsed$candidates) && length(parsed$candidates) > 0 &&
+          !is.null(parsed$candidates[[1]]$content$parts) &&
+          length(parsed$candidates[[1]]$content$parts) > 0) {
+        generated_text <- parsed$candidates[[1]]$content$parts[[1]]$text
+      } else if (!is.null(parsed$outputs) && length(parsed$outputs) > 0 &&
+                 !is.null(parsed$outputs[[1]]$content) &&
+                 !is.null(parsed$outputs[[1]]$content$parts) &&
+                 length(parsed$outputs[[1]]$content$parts) > 0) {
+        generated_text <- parsed$outputs[[1]]$content$parts[[1]]$text
+      } else if (!is.null(parsed$results) && length(parsed$results) > 0) {
+        generated_text <- paste(unlist(parsed$results), collapse="\n")
+      }
+    }
+    if (!is.null(generated_text)) {
+      return(list(ok=TRUE, status=status, text=as.character(generated_text)))
+    } else {
+      return(list(ok=FALSE, status=status, text=paste0("No parsable response. Raw: ", raw_text)))
+    }
+  } else {
+    return(list(ok=FALSE, status=status, text=paste0("HTTP ", status, " - ", raw_text)))
+  }
+}
+
+# Risk prediction functions (unchanged)
+predictHypertension <- function(data) {
+  risk_score <- 0
+  if (data$ap_hi > 140) risk_score <- risk_score + 1
+  if (data$ap_lo > 90) risk_score <- risk_score + 1
+  if (data$age > 50) risk_score <- risk_score + 1
+  if (data$weight > 80) risk_score <- risk_score + 1
+  if (risk_score >= 2) {
+    return("High")
+  } else {
+    return("Low")
+  }
+}
+
+predictDiabetes <- function(data) {
+  risk_score <- 0
+  if (data$gluc > 2) risk_score <- risk_score + 1
+  if (data$cholesterol > 2) risk_score <- risk_score + 1
+  if (data$age > 45) risk_score <- risk_score + 1
+  if (data$weight > 75) risk_score <- risk_score + 1
+  if (risk_score >= 2) {
+    return("High")
+  } else {
+    return("Low")
+  }
+}
+
+# API key
+CHATBOT_API_KEY <- "AIzaSyD8py7k79KsTHWxM6aYY6A7OMzB0NknHuo"
+
+# Generate Recommendations
+generateRecommendations <- function(risk_profile, api_key) {
+  prompt <- paste0("Provide personalized health recommendations to reduce cardiovascular risk for a patient with the following profile: ", risk_profile, ". Be detailed and helpful.")
+  generateContent(prompt, api_key)
+}
+
+# Generate Storytelling based on risk level
+generateStorytelling <- function(risk_level, top_factors, user_name, api_key) {
+  prompt <- paste0(
+    "Create a short, relatable health story for a person named ", user_name, " with ", risk_level, " cardiovascular risk.\n",
+    "Include the top contributing risk factors: ", paste(top_factors, collapse=", "), ".\n",
+    "Use friendly, motivational language, and include visual cues like progress bars or avatars to reflect the heart health status.\n",
+    "Make it engaging and easy to understand for a general audience."
+  )
+  generateContent(prompt, api_key)
+}
+
+# UI with expanded CSS styling
+ui <- fluidPage(
+  useShinyjs(),
+  # Custom CSS for styling
+  tags$head(
+    tags$style(HTML("
+      /* Reset some default styles for consistency */
+      body {
+        background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        color: #fff;
+        margin: 0;
+        padding: 0;
+      }
+
+      /* Main title styles */
+      h1 {
+        font-family: 'Times New Roman', serif;
+        font-size: 3em;
+        text-align: center;
+        color: #00ffe8;
+        margin-top: 20px;
+        letter-spacing: 2px;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        padding-bottom: 10px;
+      }
+
+      /* Tabs styling with animated hover effects */
+      .nav-tabs {
+        margin-top: 20px;
+        border-bottom: 2px solid #00ffe8;
+      }
+      .nav-tabs .nav-item.show .nav-link, .nav-tabs .nav-link.active {
+        background-color: #00ffe8 !important;
+        color: #000 !important;
+        border-radius: 10px 10px 0 0;
+        font-weight: bold;
+        box-shadow: inset 0 -3px 0 #000;
+      }
+      .nav-tabs .nav-link {
+        color: #fff;
+        font-weight: bold;
+        border: none;
+        border-radius: 10px 10px 0 0;
+        margin-right: 4px;
+        padding: 10px 20px;
+        transition: background 0.3s, transform 0.2s, box-shadow 0.3s;
+        cursor: pointer;
+      }
+      .nav-tabs .nav-link:hover {
+        background-color: #00cccc;
+        cursor: pointer;
+        transform: scale(1.02);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+      }
+
+      /* Container styling for overall layout */
+      .container {
+        padding: 20px;
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+
+      /* Card styling with gradient, shadow, rounded corners */
+      .card {
+        background: linear-gradient(135deg, #1e222a, #2c3e50);
+        border-radius: 15px;
+        padding: 25px;
+        box-shadow: 0 8px 20px rgba(0,255,232,0.2);
+        transition: box-shadow 0.3s, transform 0.3s, background 0.3s;
+        margin-top: 20px;
+        border: 1px solid #00ffe8;
+      }
+      .card:hover {
+        box-shadow: 0 12px 30px rgba(0,255,232,0.4);
+        transform: translateY(-2px);
+        background: linear-gradient(135deg, #2c3e50, #34495e);
+      }
+
+      /* Buttons with smooth hover effects and vibrant colors */
+      button, .btn {
+        background-color: #00ffe8;
+        border: none;
+        color: #000;
+        font-weight: bold;
+        padding: 12px 20px;
+        border-radius: 10px;
+        font-size: 1em;
+        cursor: pointer;
+        transition: background 0.3s, transform 0.2s, box-shadow 0.3s;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+      }
+      button:hover, .btn:hover {
+        background-color: #00cccc;
+        transform: scale(1.02);
+        box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+      }
+      button:active, .btn:active {
+        transform: scale(0.98);
+        box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
+      }
+
+      /* Input fields styling with focus effects for better UX */
+      input[type=number], select, textarea {
+        background-color: #1e222a;
+        border: 2px solid #00ffe8;
+        border-radius: 8px;
+        padding: 10px;
+        color: #fff;
+        width: 100%;
+        font-size: 1em;
+        margin-top: 8px;
+        transition: border-color 0.3s, box-shadow 0.3s, background-color 0.3s;
+      }
+      input[type=number]:focus, select:focus, textarea:focus {
+        border-color: #ff0;
+        box-shadow: 0 0 10px #00ffe8;
+        outline: none;
+        background-color: #2c3e50;
+      }
+
+      /* Output display for predictions */
+      #prediction {
+        font-size: 1.4em;
+        font-weight: bold;
+        margin-top: 10px;
+        padding: 10px;
+        background-color: rgba(0,255,232,0.2);
+        border-radius: 10px;
+        border: 2px solid #00ffe8;
+        font-family: 'Times New Roman', serif;
+        color: #fff;
+        transition: background-color 0.3s, box-shadow 0.3s;
+      }
+
+      /* Chart container styling for clear separation */
+      #risk_comparison {
+        margin-top: 20px;
+      }
+
+      /* Chatbox for conversation display */
+      #chatbox {
+        background-color: #1e222a;
+        border-radius: 8px;
+        padding: 15px;
+        height: 350px;
+        overflow-y: auto;
+        font-family: 'Courier New', monospace;
+        font-size: 14px;
+        border: 2px solid #00ffe8;
+        margin-bottom: 15px;
+        color: #fff;
+        transition: box-shadow 0.3s, background-color 0.3s;
+      }
+      #chatbox:hover {
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        background-color: #2c3e50;
+      }
+
+      /* Chat input field styles with focus effects */
+      #chat_prompt {
+        width: 100%;
+        resize: none;
+        padding: 10px;
+        border-radius: 8px;
+        border: 2px solid #00ffe8;
+        background-color: #1e222a;
+        color: #fff;
+        font-family: 'Courier New', monospace;
+        font-size: 14px;
+        margin-top: 10px;
+        transition: border-color 0.3s, box-shadow 0.3s, background-color 0.3s;
+      }
+      #chat_prompt:focus {
+        border-color: #ff0;
+        box-shadow: 0 0 10px #00ffe8;
+        outline: none;
+        background-color: #2c3e50;
+      }
+
+      /* Voice control buttons styling with hover effects for usability */
+      #voiceButtons {
+        margin-top: 10px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      #voiceButtons button {
+        flex: 1 1 45%;
+        font-size: 1.2em;
+        padding: 12px;
+        border-radius: 8px;
+        background-color: #34495e;
+        border: 2px solid #00ffe8;
+        transition: background 0.3s, transform 0.2s, box-shadow 0.3s;
+        cursor: pointer;
+        color: #ecf0f1;
+        min-width: 120px;
+      }
+      #voiceButtons button:hover {
+        background-color: #3a5872;
+        transform: scale(1.02);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+      }
+
+      /* Sentiment & Emotional Profile of Recommendations styles for readability */
+      #recommendation_tone, #emotional_sentiment_profile {
+        background-color: rgba(255,255,255,0.05);
+        padding: 15px;
+        border-radius: 10px;
+        border: 2px solid #00ffe8;
+        margin-top: 10px;
+        white-space: pre-wrap;
+        font-family: 'Courier New', monospace;
+        font-size: 14px;
+        color: #fff;
+        transition: background-color 0.3s, box-shadow 0.3s;
+      }
+      #recommendation_tone:hover, #emotional_sentiment_profile:hover {
+        background-color: rgba(255,255,255,0.1);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      }
+
+      /* Feedback form styling */
+      .question {
+        margin-top: 15px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .question textarea {
+        height: 60px;
+        resize: vertical;
+        border-radius: 8px;
+        border: 2px solid #00ffe8;
+        background-color: #1e222a;
+        color: #fff;
+        padding: 8px;
+        font-family: 'Courier New', monospace;
+        font-size: 14px;
+        transition: border-color 0.3s, box-shadow 0.3s;
+      }
+      .question textarea:focus {
+        border-color: #ff0;
+        box-shadow: 0 0 10px #00ffe8;
+        outline: none;
+        background-color: #2c3e50;
+      }
+
+      /* Download button styling with hover effect */
+      #download_recommendations {
+        background-color: #00ffe8;
+        border-radius: 10px;
+        padding: 12px 20px;
+        font-weight: bold;
+        font-size: 1em;
+        cursor: pointer;
+        transition: background 0.3s, transform 0.2s, box-shadow 0.3s;
+        margin-top: 10px;
+        color: #000;
+        border: none;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+      }
+      #download_recommendations:hover {
+        background-color: #00cccc;
+        transform: scale(1.02);
+        box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+      }
+
+      /* Footer or extra styling for consistency */
+      /* Additional hover effects for all buttons and links */
+      a, .action-button {
+        transition: all 0.3s ease-in-out;
+      }
+      a:hover, .action-button:hover {
+        opacity: 0.8;
+      }
+
+      /* Responsive adjustments for smaller screens */
+      @media(max-width: 768px){
+        #voiceButtons {
+          flex-direction: column;
+        }
+        #voiceButtons button {
+          flex: 1 1 100%;
+        }
+      }
+    "))
+  ),
+  
+  # Main title
+  titlePanel(tags$h1("💻 Cardiovascular & Metabolic Risk Predictor")),
+  
+  # Tabs layout
+  tabsetPanel(
+    id="main_tabs",
+    type="tabs",
+    # Upload & Data Input
+    tabPanel(
+      "Upload & Data Input",
+      fluidRow(
+        column(
+          width=4,
+          div(
+            class="card",
+            h3("Upload Data"),
+            fileInput("file", "Upload CSV File", accept=".csv"),
+            hr(),
+            h3("Input Your Data"),
+            textInput("name", "Your Name", value="Your Name"),
+            numericInput("age", "Age (years)", 50, min=1, max=100),
+            selectInput("gender", "Gender", choices=c("Female"=1,"Male"=2)),
+            numericInput("height", "Height (cm)", 170),
+            numericInput("weight", "Weight (kg)", 70),
+            numericInput("ap_hi", "Systolic BP", 120),
+            numericInput("ap_lo", "Diastolic BP", 80),
+            selectInput("cholesterol", "Cholesterol", choices=c("Normal"=1,"Above Normal"=2,"Well Above Normal"=3)),
+            selectInput("gluc", "Glucose", choices=c("Normal"=1,"Above Normal"=2,"Well Above Normal"=3)),
+            selectInput("smoke", "Smokes?", choices=c("No"=0,"Yes"=1)),
+            selectInput("alco", "Drinks Alcohol?", choices=c("No"=0,"Yes"=1)),
+            selectInput("active", "Physically Active?", choices=c("No"=0,"Yes"=1)),
+            actionButton("predict", "Predict Risk", icon=icon("heartbeat"))
+          )
+        ),
+        column(
+          width=8,
+          div(
+            class="card",
+            h3("Prediction Result"),
+            verbatimTextOutput("prediction"),
+            hr(),
+            h4("Comparison of Risks"),
+            plotOutput("risk_comparison")
+          )
+        )
+      )
+    ),
+    # Model & Data
+    tabPanel(
+      "Model & Data",
+      fluidRow(
+        column(
+          width=12,
+          div(
+            class="card",
+            h3("Dataset Preview"),
+            DTOutput("dataTable")
+          )
+        )
+      )
+    ),
+    # Models & Metrics
+    tabPanel(
+      "Models & Metrics",
+      tabsetPanel(
+        type="tabs",
+        tabPanel(
+          "Logistic Regression",
+          fluidRow(
+            column(
+              width=12,
+              div(
+                class="card",
+                h3("Logistic Regression Model Summary"),
+                verbatimTextOutput("logreg_summary"),
+                hr(),
+                h3("Model Performance Metrics"),
+                verbatimTextOutput("logreg_metrics"),
+                hr(),
+                h3("ROC Curve & AUC"),
+                plotOutput("logreg_roc")
+              )
+            )
+          )
+        ),
+        tabPanel(
+          "Random Forest",
+          fluidRow(
+            column(
+              width=12,
+              div(
+                class="card",
+                h3("Random Forest Model Summary"),
+                verbatimTextOutput("rf_summary"),
+                hr(),
+                h3("Model Performance Metrics"),
+                verbatimTextOutput("rf_metrics"),
+                hr(),
+                h3("ROC Curve & AUC"),
+                plotOutput("rf_roc")
+              )
+            )
+          )
+        ),
+        tabPanel(
+          "XGBoost",
+          fluidRow(
+            column(
+              width=12,
+              div(
+                class="card",
+                h3("XGBoost Model Summary"),
+                verbatimTextOutput("xgb_summary"),
+                hr(),
+                h3("Model Performance Metrics"),
+                verbatimTextOutput("xgb_metrics"),
+                hr(),
+                h3("ROC Curve & AUC"),
+                plotOutput("xgb_roc")
+              )
+            )
+          )
+        )
+      )
+    ),
+    # Chatbot
+    tabPanel(
+      "Chatbot",
+      fluidRow(
+        column(
+          width=4,
+          style="background:#2c3e50; padding:15px; border-radius:8px;",
+          h3("Interact with the Chatbot", style="color:#fff;"),
+          div(
+            style="margin-bottom:15px; padding:10px; background:#34495e; border-radius:8px; color:#ecf0f1;",
+            h4("Would you like the chatbot to speak to you?"),
+            radioButtons(
+              inputId = "speak_option",
+              label = NULL,
+              choices = c("Yes"=TRUE, "No"=FALSE),
+              selected = FALSE,
+              inline=TRUE
+            )
+          ),
+          tags$div(
+            style="background:#34495e; padding:10px; border-radius:8px; margin-bottom:10px;",
+            tags$h4("Chat Instructions"),
+            tags$ul(
+              tags$li("Use the microphone button to speak your message. Your speech will be added directly to the chat."),
+              tags$li("Use the text box to type your message."),
+              tags$li("Click 'Send' to submit your message.")
+            )
+          ),
+          tags$div(
+            id="voiceButtons",
+            style="display:flex; gap:10px;",
+            actionButton("start_voice", "🎤 Talk"),
+            actionButton("stop_voice", "🛑 Stop")
+          ),
+          textAreaInput("chat_prompt", "Your message", value="", rows=3, placeholder="Type your message here..."),
+          actionButton("send_chat", "Send", icon=icon("paper-plane"))
+        ),
+        column(
+          width=8,
+          style="background:#2c3e50; padding:15px; border-radius:8px;",
+          h4("Conversation"),
+          div(
+            style="margin-top:10px; background:#add8e6; border-radius:8px; padding:10px; height:400px; overflow-y:auto;",
+            DTOutput("chat_table")
+          )
+        )
+      )
+    ),
+    # Sentiment & Tone Analysis
+    tabPanel(
+      "Sentiment & Tone Analysis",
+      fluidRow(
+        column(
+          width=12,
+          div(
+            style="background:#34495e; padding:15px; border-radius:8px; margin-top:20px;",
+            h3("Sentiment & Tone of Recommendations"),
+            verbatimTextOutput("recommendation_tone"),
+            hr(),
+            h3("Emotional Sentiment Profile of Recommendations"),
+            verbatimTextOutput("emotional_sentiment_profile"),
+            hr(),
+            h4("Topic Analysis of Recommendations (Placeholder)"),
+            p("Further NLP techniques can be applied here to analyze the tone, positivity, motivation, and actionability of the recommendations.")
+          )
+        )
+      )
+    ),
+    # Your Recommendations page
+    tabPanel(
+      "Your Recommendations",
+      fluidRow(
+        column(
+          width=12,
+          style="background:#34495e; padding:15px; border-radius:8px;",
+          h3("Personalized Health Recommendations"),
+          p("Based on your cardiovascular risk prediction, here are tailored recommendations to improve your health:"),
+          actionButton("get_recommendations", "Get Recommendations", icon=icon("medkit")),
+          br(), br(),
+          downloadButton("download_recommendations", "Download Recommendations as PDF"),
+          hr(),
+          verbatimTextOutput("recommendation_text")
+        )
+      )
+    ),
+    # Post-Recommendation Questionnaire
+    tabPanel(
+      "Post-Recommendation Questionnaire",
+      fluidRow(
+        column(
+          width=12,
+          style="background:#34495e; padding:15px; border-radius:8px;",
+          h3("Your Feedback on the Recommendations"),
+          p("Please answer the following questions to tell us if you understood and plan to implement the recommendations."),
+          uiOutput("question_ui"),
+          actionButton("submit_answers", "Submit Answers"),
+          hr(),
+          verbatimTextOutput("thank_you_msg")
+        )
+      )
+    ),
+    # New: Emotion Analysis Explanation
+    tabPanel(
+      "Emotion Analysis",
+      fluidRow(
+        column(
+          width=12,
+          style="background:#34495e; padding:15px; border-radius:8px;",
+          h3("Emotion Scores and Explanation"),
+          p("Click the button below to generate a detailed explanation of the emotion scores based on your recent analysis."),
+          actionButton("generate_emotion_explanation", "Generate Explanation"),
+          hr(),
+          verbatimTextOutput("emotion_scores"),
+          hr(),
+          verbatimTextOutput("emotion_explanation")
+        )
+      )
+    ),
+    # New: Storytelling Tab with Sentiment for Storytelling
+    tabPanel(
+      "Storytelling",
+      fluidRow(
+        column(
+          width=12,
+          style="background:#34495e; padding:15px; border-radius:8px;",
+          h3("Your Personalized Health Story"),
+          p("Based on your risk assessment, a tailored story will be generated to motivate and inform you about your heart health."),
+          actionButton("generate_story", "Generate Your Story"),
+          hr(),
+          verbatimTextOutput("story_text"),
+          # Optional: visual avatar or progress bar can be added here
+          uiOutput("story_visual")
+        )
+      )
+    ),
+    # Sentiment for Storytelling - New Tab
+    tabPanel(
+      "Sentiment for Storytelling",
+      fluidRow(
+        column(
+          width=12,
+          style="background:#34495e; padding:15px; border-radius:8px;",
+          h3("Analyze the Tone & Reliability of the Storytelling"),
+          p("Click the button below to analyze the sentiment tone of your story and assess its reliability."),
+          actionButton("analyze_story_tone", "Analyze Story Tone & Reliability"),
+          hr(),
+          h4("Storytelling Content"),
+          verbatimTextOutput("story_content"),
+          hr(),
+          h4("Sentiment & Tone Analysis"),
+          verbatimTextOutput("story_tone_analysis"),
+          hr(),
+          h4("Reliability Assessment"),
+          verbatimTextOutput("story_reliability")
+        )
+      )
+    )
+  )
+)
+
+# SERVER
+server <- function(input, output, session) {
+  # Data & Model Processing
+  data <- reactive({
+    req(input$file)
+    df <- read.csv(input$file$datapath, sep=";")
+    df$age <- round(df$age/365)
+    df$cardio <- as.factor(df$cardio)
+    df
+  })
+
+  model_logreg <- reactiveVal()
+  model_rf <- reactiveVal()
+  model_xgb <- reactiveVal()
+
+  logreg_summary <- reactiveVal()
+  logreg_metrics <- reactiveVal()
+  rf_summary <- reactiveVal()
+  rf_metrics <- reactiveVal()
+  xgb_summary <- reactiveVal()
+  xgb_metrics <- reactiveVal()
+
+  roc_data <- reactiveValues(logreg=NULL, rf=NULL, xgb=NULL)
+
+  latest_risk <- reactiveVal(NULL)
+  all_risks <- reactiveValues(hypertension=NULL, diabetes=NULL, cvd=NULL)
+
+  # Train models
+  observeEvent(input$file, {
+    req(data())
+    df <- data()
+    set.seed(123)
+    train_idx <- createDataPartition(df$cardio, p=0.8, list=FALSE)
+    trainData <- df[train_idx,]
+    testData <- df[-train_idx,]
+    
+    # Logistic Regression
+    fit_lr <- glm(cardio ~ age+gender+height+weight+ap_hi+ap_lo+cholesterol+gluc+smoke+alco+active, data=trainData, family=binomial)
+    model_logreg(fit_lr)
+    logreg_summary(capture.output(summary(fit_lr)))
+    probs_lr <- predict(fit_lr, newdata=testData, type="response")
+    preds_lr <- ifelse(probs_lr>0.5,1,0)
+    cm_lr <- confusionMatrix(factor(preds_lr), factor(testData$cardio))
+    logreg_metrics(capture.output(cm_lr))
+    roc_data$logreg <- roc(as.numeric(as.character(testData$cardio)), probs_lr)
+
+    # Random Forest
+    fit_rf <- randomForest(as.factor(cardio)~., data=trainData, importance=TRUE, ntree=100)
+    model_rf(fit_rf)
+    rf_summary(capture.output(print(fit_rf)))
+    preds_rf <- predict(fit_rf, newdata=testData)
+    cm_rf <- confusionMatrix(preds_rf, testData$cardio)
+    rf_metrics(capture.output(cm_rf))
+    probs_rf <- predict(fit_rf, newdata=testData, type="prob")[,2]
+    roc_data$rf <- roc(as.numeric(as.character(testData$cardio)), probs_rf)
+
+    # XGBoost
+    train_matrix <- xgb.DMatrix(
+      data=as.matrix(trainData[, c("age","gender","height","weight","ap_hi","ap_lo","cholesterol","gluc","smoke","alco","active")]),
+      label=as.numeric(as.character(trainData$cardio))
+    )
+    test_matrix <- xgb.DMatrix(
+      data=as.matrix(testData[, c("age","gender","height","weight","ap_hi","ap_lo","cholesterol","gluc","smoke","alco","active")]),
+      label=as.numeric(as.character(testData$cardio))
+    )
+    params <- list(objective="binary:logistic", eval_metric="logloss", max_depth=3, eta=0.1)
+    fit_xgb <- xgb.train(params=params, data=train_matrix, nrounds=50, verbose=0)
+    model_xgb(fit_xgb)
+    preds_xgb_prob <- predict(fit_xgb, test_matrix)
+    preds_xgb <- ifelse(preds_xgb_prob>0.5,1,0)
+    cm_xgb <- confusionMatrix(factor(preds_xgb), testData$cardio)
+    xgb_summary(capture.output(print(fit_xgb)))
+    xgb_metrics(capture.output(cm_xgb))
+    roc_data$xgb <- roc(as.numeric(as.character(testData$cardio)), preds_xgb_prob)
+  })
+
+  # Data table
+  output$dataTable <- renderDT({
+    req(input$file)
+    datatable(read.csv(input$file$datapath, sep=";"), options=list(pageLength=5))
+  })
+
+  # Prediction event
+  observeEvent(input$predict, {
+    req(model_logreg())
+    new_data <- data.frame(
+      age=input$age,
+      gender=as.numeric(input$gender),
+      height=input$height,
+      weight=input$weight,
+      ap_hi=input$ap_hi,
+      ap_lo=input$ap_lo,
+      cholesterol=as.numeric(input$cholesterol),
+      gluc=as.numeric(input$gluc),
+      smoke=as.numeric(input$smoke),
+      alco=as.numeric(input$alco),
+      active=as.numeric(input$active)
+    )
+    prob_lr <- predict(model_logreg(), new_data, type="response")
+    risk_text <- if (prob_lr > 0.5) "🚩 High Risk of CVD" else "✅ Low Risk of CVD"
+    latest_risk(paste0("Your CVD risk probability is ", round(prob_lr,3), ". Risk level: ", ifelse(prob_lr>0.5,"High","Low")))
+
+    ht_result <- predictHypertension(new_data)
+    all_risks$hypertension <- ht_result
+
+    db_result <- predictDiabetes(new_data)
+    all_risks$diabetes <- db_result
+
+    output$prediction <- renderText({
+      paste0("CVD Risk Probability: ", round(prob_lr,3), 
+             "\nRisk: ", ifelse(prob_lr>0.5,"High","Low"),
+             "\nHypertension Risk: ", ht_result,
+             "\nDiabetes Risk: ", db_result)
+    })
+
+    risk_levels <- data.frame(
+      Condition=c("CVD", "Hypertension", "Diabetes"),
+      Risk=c(
+        ifelse(prob_lr>0.5,1,0),
+        ifelse(ht_result=="High",1,0),
+        ifelse(db_result=="High",1,0)
+      )
+    )
+
+    output$risk_comparison <- renderPlot({
+      ggplot(risk_levels, aes(x=Condition, y=Risk, fill=as.factor(Risk))) +
+        geom_bar(stat="identity") +
+        scale_fill_manual(values=c("0"="#3498db","1"="#e74c3c"), labels=c("Low","High")) +
+        ylim(0,1.2) +
+        labs(title="Risk Level Comparison", y="Risk (0=Low, 1=High)", fill="Risk") +
+        theme_minimal()
+    })
+  })
+
+  # Model summaries and ROC plots
+  output$logreg_summary <- renderText({ req(logreg_summary()); paste(logreg_summary(), collapse="\n") })
+  output$logreg_metrics <- renderText({ req(logreg_metrics()); paste(logreg_metrics(), collapse="\n") })
+  output$rf_summary <- renderText({ req(rf_summary()); paste(rf_summary(), collapse="\n") })
+  output$rf_metrics <- renderText({ req(rf_metrics()); paste(rf_metrics(), collapse="\n") })
+  output$xgb_summary <- renderText({ req(xgb_summary()); paste(xgb_summary(), collapse="\n") })
+  output$xgb_metrics <- renderText({ req(xgb_metrics()); paste(xgb_metrics(), collapse="\n") })
+
+  output$logreg_roc <- renderPlot({
+    req(roc_data$logreg)
+    plot(roc_data$logreg, col="blue", main="ROC Curve - Logistic Regression")
+    legend("bottomright", legend=paste("AUC =", round(auc(roc_data$logreg),3)), col="blue", lwd=2)
+  })
+  output$rf_roc <- renderPlot({
+    req(roc_data$rf)
+    plot(roc_data$rf, col="green", main="ROC Curve - Random Forest")
+    legend("bottomright", legend=paste("AUC =", round(auc(roc_data$rf),3)), col="green", lwd=2)
+  })
+  output$xgb_roc <- renderPlot({
+    req(roc_data$xgb)
+    plot(roc_data$xgb, col="red", main="ROC Curve - XGBoost")
+    legend("bottomright", legend=paste("AUC =", round(auc(roc_data$xgb),3)), col="red", lwd=2)
+  })
+
+  # ----------- Chatbot with sentiment & emotional profile -----------
+
+  chat_history <- reactiveVal(data.frame(role=character(), message=character(), sentiment_score=double(), sentiment_label=character(), stringsAsFactors=FALSE))
+  chatbot_api_key <- reactiveVal(CHATBOT_API_KEY)
+  speak_pref <- reactiveVal(FALSE)
+
+  # Toggle speak option
+  observeEvent(input$speak_option, {
+    speak_pref(as.logical(input$speak_option))
+  })
+
+  # Send chat message
+  observeEvent(input$send_chat, {
+    req(input$chat_prompt)
+    api_key <- chatbot_api_key()
+
+    # Context info
+    risk_info <- latest_risk()
+    context_message <- ""
+    if (!is.null(risk_info)) {
+      context_message <- paste0("Here's your current health info: ", risk_info, "\n")
+    }
+    chat_hist <- chat_history()
+    full_prompt <- paste0(
+      context_message,
+      "Conversation so far:\n",
+      paste0(chat_hist$role, ": ", chat_hist$message, collapse="\n"),
+      "\nYou: ", input$chat_prompt
+    )
+
+    # Sentiment analysis of user message
+    user_sent <- sentiment(input$chat_prompt)
+    user_score <- mean(user_sent$sentiment)
+    user_score_clamped <- max(min(user_score, 1), -1)
+    user_label <- if (user_score_clamped > 0.05) {
+      "Positive"
+    } else if (user_score_clamped < -0.05) {
+      "Negative"
+    } else {
+      "Neutral"
+    }
+    new_user <- data.frame(role="user", message=input$chat_prompt, sentiment_score=user_score, sentiment_label=user_label, stringsAsFactors=FALSE)
+    chat_history(rbind(chat_history(), new_user))
+    # Generate bot reply
+    bot_response <- generateContent(full_prompt, api_key)
+    bot_text <- if (bot_response$ok) bot_response$text else paste0("[Error]: ", bot_response$text)
+    # Sentiment for bot reply
+    bot_sent <- sentiment(bot_text)
+    bot_score <- mean(bot_sent$sentiment)
+    bot_score_clamped <- max(min(bot_score, 1), -1)
+    bot_label <- if (bot_score_clamped > 0.05) {
+      "Positive"
+    } else if (bot_score_clamped < -0.05) {
+      "Negative"
+    } else {
+      "Neutral"
+    }
+    new_bot <- data.frame(role="assistant", message=bot_text, sentiment_score=bot_score, sentiment_label=bot_label, stringsAsFactors=FALSE)
+    chat_history(rbind(chat_history(), new_bot))
+    updateTextAreaInput(session, "chat_prompt", value="")
+
+    # Speech synthesis
+    if (isTRUE(speak_pref())) {
+      session$sendCustomMessage(type='speakText', message=bot_text)
+    }
+
+    # Trigger recommendation if relevant
+    if (grepl("recommend|advice|how to reduce risk", tolower(input$chat_prompt))) {
+      rec_prompt <- "Based on the user's health data and risk profile, provide personalized health recommendations to reduce cardiovascular risk. Be detailed and helpful."
+      rec_response <- generateContent(rec_prompt, api_key)
+      rec_text <- if (rec_response$ok) rec_response$text else paste0("[Error]: ", rec_response$text)
+      rec_df <- data.frame(role="assistant", message=rec_text, sentiment_score=NA, sentiment_label=NA, stringsAsFactors=FALSE)
+      chat_history(rbind(chat_history(), rec_df))
+      if (isTRUE(speak_pref())) {
+        session$sendCustomMessage(type='speakText', message=rec_text)
+      }
+    }
+  })
+
+  # Chat table output
+  output$chat_table <- renderDT({
+    df <- chat_history()
+    if(nrow(df)==0) return(NULL)
+    datatable(df, colnames=c("Role", "Message", "Sentiment Score", "Sentiment Label"), options=list(pageLength=20))
+  })
+
+  # Clear chat
+  observeEvent(input$clear_chat, {
+    chat_history(data.frame(role=character(), message=character(), sentiment_score=double(), sentiment_label=character(), stringsAsFactors=FALSE))
+    latest_risk(NULL)
+  })
+
+  # Voice recognition JS
+  session$onFlushed(function() {
+    session$sendCustomMessage(type='initVoiceRecognition', message=list())
+  })
+  observe({
+    session$sendCustomMessage(type='voiceRecognition', message=list())
+  })
+
+  # Voice recognition result
+  observeEvent(input$voice_text, {
+    new_user <- data.frame(role="user", message=input$voice_text, sentiment_score=NA, sentiment_label=NA, stringsAsFactors=FALSE)
+    chat_history(rbind(chat_history(), new_user))
+    updateTextAreaInput(session, "chat_prompt", value=input$voice_text)
+  })
+
+  # Voice buttons
+  observeEvent(input$start_voice, {
+    session$sendCustomMessage(type='startVoice', message=list())
+  })
+  observeEvent(input$stop_voice, {
+    session$sendCustomMessage(type='stopVoice', message=list())
+  })
+
+  # ----------- Sentiment & Emotional Profile of Recommendations -----------
+
+  # Reactive value to store NRC scores
+  rv_emotional_profile <- reactiveVal(NULL)
+
+  # When user clicks "Get Recommendations"
+  observeEvent(input$get_recommendations, {
+    req(latest_risk())
+    # Generate recommendation text
+    rec_response <- generateRecommendations(latest_risk(), CHATBOT_API_KEY)
+    rec_text <- if (rec_response$ok) rec_response$text else paste0("[Error]: ", rec_response$text)
+    rv_recommendations$text <- rec_text
+    output$recommendation_text <- renderText({ rec_text })
+
+    # Generate emotional paragraph
+    analysis_prompt <- paste0(
+      "Analyze the following health recommendation in terms of emotional tone, positivity, motivation, and discouragement, and provide a paragraph summary and should not be in one line. Have bullet points please.:\n\n",
+      rec_text
+    )
+    emotional_analysis <- generateContent(analysis_prompt, CHATBOT_API_KEY)
+
+    # Compute NRC scores if possible
+    if (emotional_analysis$ok) {
+      nrc_scores <- get_nrc_sentiment(rec_text)
+      # Sum scores for each emotion
+      nrc_vector <- sapply(c("joy","sadness","anger","fear","trust","disgust","surprise","anticipation"), function(emotion) {
+        sum(nrc_scores[[emotion]])
+      })
+      # Store in reactive value
+      rv_emotional_profile(list(
+        paragraph=emotional_analysis$text,
+        scores=nrc_vector
+      ))
+    } else {
+      rv_emotional_profile(NULL)
+    }
+
+    # Render in the output
+    output$recommendation_tone <- renderText({
+      profile <- rv_emotional_profile()
+      if (is.null(profile)) {
+        return(paste0("Error in analyzing emotional profile."))
+      }
+      # Format scores
+      scores_text <- paste0(
+        "Emotional Intensity:\n",
+        paste0(
+          toupper(names(profile$scores)),
+          ": ",
+          round(profile$scores, 2),
+          collapse="\n"
+        )
+      )
+      paste0(profile$paragraph, "\n\n", scores_text)
+    })
+
+    # Switch to the Sentiment & Tone tab
+    updateTabsetPanel(session, "main_tabs", selected = "Sentiment & Tone Analysis")
+  })
+
+  # Generate questions for Post-Recommendation
+  questions <- reactiveVal(NULL)
+  observeEvent(input$main_tabs, {
+    if (input$main_tabs == "Post-Recommendation Questionnaire") {
+      prompt_q <- "Generate 4 open-ended questions for a patient to assess if they understood and will implement health recommendations about reducing cardiovascular risk."
+      res <- generateContent(prompt_q, CHATBOT_API_KEY)
+      if (res$ok) {
+        q_text <- res$text
+        q_list <- unlist(strsplit(q_text, "\n+"))
+        q_list <- trimws(q_list)
+        q_list <- q_list[q_list != ""]
+        questions(q_list)
+      } else {
+        questions(c(
+          "Did you understand the recommendations provided?",
+          "Do you plan to implement these recommendations?",
+          "What challenges do you anticipate in following these suggestions?",
+          "Any additional comments or questions?"
+        ))
+      }
+    }
+  })
+
+  output$question_ui <- renderUI({
+    req(questions())
+    qlist <- questions()
+    lapply(seq_along(qlist), function(i) {
+      div(
+        class="question",
+        tags$label(qlist[i]),
+        textAreaInput(
+          inputId = paste0("question_", i),
+          label = NULL,
+          value = "",
+          rows=3,
+          width="100%"
+        )
+      )
+    })
+  })
+
+  # Submit answers
+  observeEvent(input$submit_answers, {
+    req(questions())
+    answers <- sapply(seq_along(questions()), function(i) {
+      input[[paste0("question_", i)]]
+    })
+    # Could store answers here
+    output$thank_you_msg <- renderText({
+      paste("Thank you for your feedback! Your responses have been recorded.")
+    })
+  })
+
+  # Download recommendations as PDF
+  rv_recommendations <- reactiveValues(text = NULL)
+  observeEvent(input$get_recommendations, {
+    req(latest_risk())
+    rec_response <- generateRecommendations(latest_risk(), CHATBOT_API_KEY)
+    rec_text <- if (rec_response$ok) rec_response$text else paste0("[Error]: ", rec_response$text)
+    rv_recommendations$text <- rec_text
+  })
+
+  output$download_recommendations <- downloadHandler(
+    filename = function() {
+      paste0("Health_Recommendations_", Sys.Date(), ".pdf")
+    },
+    content = function(file) {
+      req(rv_recommendations$text)
+      tempRmd <- tempfile(fileext = ".Rmd")
+      writeLines(
+        c(
+          "---",
+          "title: \"Health Recommendations\"",
+          "output: pdf_document",
+          "---",
+          "",
+          "## Personalized Health Recommendations",
+          "",
+          rv_recommendations$text
+        ),
+        con = tempRmd
+      )
+      rmarkdown::render(tempRmd, output_file = file, quiet=TRUE)
+    }
+  )
+
+  # ----------- New: Emotion Analysis Explanation -----------
+
+  # Reactive value to store emotion scores for display
+  emotion_scores <- reactiveVal(NULL)
+  emotion_explanation <- reactiveVal(NULL)
+
+  observeEvent(input$generate_emotion_explanation, {
+    req(rv_emotional_profile())
+    profile <- rv_emotional_profile()
+    # Prepare prompt for generateContent
+    prompt_explain <- paste0(
+      "Based on the following emotion scores:\n",
+      paste0(
+        toupper(names(profile$scores)),
+        ": ",
+        round(profile$scores, 2),
+        collapse="\n"
+      ),
+      "\n\nExplain in detail why these emotions have these specific scores, providing possible reasons and reasoning for each emotion based on the context of the health recommendations and the sentiment analysis."
+    )
+    # Generate detailed explanation
+    explanation_result <- generateContent(prompt_explain, CHATBOT_API_KEY)
+    if (explanation_result$ok) {
+      emotion_explanation(explanation_result$text)
+    } else {
+      emotion_explanation(paste0("[Error generating explanation]: ", explanation_result$text))
+    }
+    # Display scores
+    score_text <- paste0(
+      "Emotion Scores:\n",
+      paste0(
+        toupper(names(profile$scores)),
+        ": ",
+        round(profile$scores, 2),
+        collapse="\n"
+      )
+    )
+    emotion_scores(score_text)
+    # Display explanation
+    output$emotion_scores <- renderText({ emotion_scores() })
+    output$emotion_explanation <- renderText({ emotion_explanation() })
+  })
+
+  # ----------- Generate Storytelling based on risk prediction -----------
+
+  # Reactive to store the narrative
+  rv_story <- reactiveVal(NULL)
+  rv_story_visual <- reactiveVal(NULL)
+
+  observeEvent(input$generate_story, {
+    req(latest_risk())
+    # Determine risk category based on probability thresholds
+    # Recompute probability for CVD risk
+    req(model_logreg())
+    new_data <- data.frame(
+      age=input$age,
+      gender=as.numeric(input$gender),
+      height=input$height,
+      weight=input$weight,
+      ap_hi=input$ap_hi,
+      ap_lo=input$ap_lo,
+      cholesterol=as.numeric(input$cholesterol),
+      gluc=as.numeric(input$gluc),
+      smoke=as.numeric(input$smoke),
+      alco=as.numeric(input$alco),
+      active=as.numeric(input$active)
+    )
+    prob_lr <- predict(model_logreg(), new_data, type="response")
+    risk_level <- if (prob_lr > 0.7) {
+      "High"
+    } else if (prob_lr > 0.4) {
+      "Moderate"
+    } else {
+      "Low"
+    }
+    user_name <- input$name
+    # For top contributing factors, for simplicity, list some factors
+    top_factors <- c()
+    if (new_data$ap_hi > 140) top_factors <- c(top_factors, "High systolic blood pressure")
+    if (new_data$ap_lo > 90) top_factors <- c(top_factors, "High diastolic blood pressure")
+    if (new_data$age > 50) top_factors <- c(top_factors, "Older age")
+    if (new_data$weight > 80) top_factors <- c(top_factors, "Overweight")
+    if (length(top_factors)==0) top_factors <- c("Several risk factors")
+    
+    # Generate storytelling with user name
+    story_res <- generateStorytelling(risk_level, top_factors, user_name, CHATBOT_API_KEY)
+    rv_story(story_res$text)
+    # Optional: Visual cues like progress bar
+    output$story_text <- renderText({ rv_story() })
+    output$story_visual <- renderUI({
+      risk_color <- switch(risk_level,
+                           "Low"="#27ae60",
+                           "Moderate"="#f39c12",
+                           "High"="#c0392b")
+      tags$div(
+        style="text-align:center;",
+        tags$div(
+          style=paste0("width:150px; height:150px; margin:auto; border-radius:50%; background-color:", risk_color, "; display:flex; align-items:center; justify-content:center; font-size:1.2em; color:#fff; font-weight:bold;"),
+          paste(risk_level, "Risk")
+        ),
+        # Progress bar
+        tags$div(
+          style="width:80%; height:20px; background-color:#ddd; border-radius:10px; margin:auto; margin-top:15px;",
+          tags$div(
+            style=paste0("width:", switch(risk_level, "Low"=33, "Moderate"=66, "High"=100), "%; height:100%; background-color:", risk_color, "; border-radius:10px;"),
+            ""
+          )
+        )
+      )
+    })
+  })
+
+  # ----------- New: Sentiment for Storytelling Tab Logic -----------
+
+  # For the 'Sentiment for Storytelling' tab, define reactive values
+  storytelling_content <- reactiveVal("")
+  story_tone_analysis <- reactiveVal("")
+  story_reliability <- reactiveVal("")
+
+  # Button to analyze storytelling tone
+  observeEvent(input$analyze_story_tone, {
+    req(rv_story())
+    story_text <- rv_story()
+    storytelling_content(story_text)
+    # Generate sentiment and reliability analysis
+    prompt_tone <- paste0(
+      "Analyze the tone of the following story. Indicate if it is positive, neutral, or negative. Also, assess if the story is reliable based on the emotional content and coherence.\n\n\"",
+      story_text,
+      "\"\n\nProvide a brief analysis including tone and reliability assessment."
+    )
+    analysis_result <- generateContent(prompt_tone, CHATBOT_API_KEY)
+    # Save and display
+    if (analysis_result$ok) {
+      story_tone_analysis(analysis_result$text)
+    } else {
+      story_tone_analysis(paste0("[Error]: ", analysis_result$text))
+    }
+    # For simplicity, assume the reliability is part of the analysis text
+    if (analysis_result$ok) {
+      story_reliability(analysis_result$text)
+    } else {
+      story_reliability(paste0("[Error]: ", analysis_result$text))
+    }
+    # Render outputs
+    output$story_content <- renderText({ story_text })
+    output$story_tone_analysis <- renderText({ story_tone_analysis() })
+    output$story_reliability <- renderText({ story_reliability() })
+  })
+
+  # ----------- End of server logic -----------
+
+}
+
+# JS for voice recognition & synthesis
+js_code <- '
+Shiny.addCustomMessageHandler("initVoiceRecognition", function(message) {
+  window.recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+  recognition.continuous = false;
+  recognition.interimResults = false;
+  recognition.lang = "en-US";
+
+  recognition.onresult = function(event) {
+    var transcript = event.results[0][0].transcript;
+    Shiny.setInputValue("voice_text", transcript);
+  };
+  recognition.onerror = function(event) {
+    console.error(event.error);
+  };
+});
+Shiny.addCustomMessageHandler("startVoice", function(message) {
+  if (window.recognition) {
+    recognition.start();
+  }
+});
+Shiny.addCustomMessageHandler("stopVoice", function(message) {
+  if (window.recognition) {
+    recognition.stop();
+  }
+});
+// Speech synthesis
+Shiny.addCustomMessageHandler("speakText", function(message) {
+  if ("speechSynthesis" in window) {
+    var utterance = new SpeechSynthesisUtterance(message);
+    window.speechSynthesis.speak(utterance);
+  }
+});
+'
+
+# Run app
+shinyApp(
+  ui = tagList(
+    tags$script(HTML(js_code)),
+    ui
+  ),
+  server = server
+)
+
