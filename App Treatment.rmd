@@ -1,179 +1,1805 @@
-> install.packages("shiny")
-The following package(s) will be installed:
-- shiny [1.7.5]
-These packages will be installed into "~/Recommender App/renv/library/R-4.3/x86_64-w64-mingw32".
+library(shiny)
+library(shinyjs)
+library(caret)
+library(DT)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(jsonlite)
+library(httr)
+library(ggplot2)
+library(sentimentr)
+library(syuzhet)
+library(rmarkdown)
+library(reshape2)
+ 
+# ─── API ───────────────────────────────────────────────────────────────────────
+CHATBOT_API_KEY <- "AIzaSyD8py7k79KsTHWxM6aYY6A7OMzB0NknHuo"
+ 
+generateContent <- function(prompt, api_key,
+ model_endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent") {
+ headers <- c(`Content-Type` = "application/json")
+ payload  <- list(contents = list(list(parts = list(list(text = as.character(prompt))))))
+ body_json <- jsonlite::toJSON(payload, auto_unbox = TRUE)
+ res <- tryCatch(
+   httr::POST(url = model_endpoint, httr::add_headers(.headers = headers),
+              query = list(key = api_key), body = body_json, encode = "raw", timeout(30)),
+   error = function(e) e)
+ if (inherits(res, "error")) return(list(ok=FALSE, text=paste0("Network error: ", res$message)))
+ status   <- httr::status_code(res)
+ raw_text <- tryCatch(httr::content(res, as="text", encoding="UTF-8"), error=function(e) NA_character_)
+ if (status == 200) {
+   parsed <- tryCatch(jsonlite::fromJSON(raw_text, simplifyVector=FALSE), error=function(e) NULL)
+   gtxt   <- NULL
+   if (!is.null(parsed) && !is.null(parsed$candidates) && length(parsed$candidates)>0)
+     gtxt <- parsed$candidates[[1]]$content$parts[[1]]$text
+   if (!is.null(gtxt)) return(list(ok=TRUE, status=status, text=as.character(gtxt)))
+   return(list(ok=FALSE, status=status, text=paste0("No parsable response. Raw: ", raw_text)))
+ }
+ list(ok=FALSE, status=status, text=paste0("HTTP ", status, " - ", raw_text))
+}
+ 
+# ─── CLINICAL HELPERS ──────────────────────────────────────────────────────────
+calcBMI      <- function(w, h) round(w / (h/100)^2, 1)
+bmiCategory  <- function(b) if(b<18.5)"UNDERWEIGHT" else if(b<25)"NORMAL" else if(b<30)"OVERWEIGHT" else if(b<35)"OBESE I" else "OBESE II+"
+bmiColor     <- function(b) if(b<18.5)"var(--warn)" else if(b<25)"var(--success)" else if(b<30)"var(--warn)" else "var(--danger)"
+ 
+predictHypertension <- function(d) {
+ s <- sum(d$ap_hi>140, d$ap_lo>90, d$age>50, d$weight>80)
+ ifelse(s>=2,"High","Low")
+}
+predictDiabetes <- function(d) {
+ s <- sum(d$gluc>2, d$cholesterol>2, d$age>45, d$weight>75)
+ ifelse(s>=2,"High","Low")
+}
+calcFramingham <- function(age, gender, chol, ap_hi, smoke) {
+ base <- if (gender==2) {
+   0.005*(age-45) + 0.08*(chol-1) + 0.003*(ap_hi-120) + if(smoke==1) 0.12 else 0
+ } else {
+   0.004*(age-45) + 0.06*(chol-1) + 0.0025*(ap_hi-120) + if(smoke==1) 0.09 else 0
+ }
+ pmin(pmax(base, 0.01), 0.99)
+}
+riskLabel <- function(p) if(p>0.65)"HIGH RISK" else if(p>0.4)"MODERATE RISK" else "LOW RISK"
+riskColor <- function(p) if(p>0.65)"var(--danger)" else if(p>0.4)"var(--warn)" else "var(--success)"
+riskClass <- function(p) if(p>0.65)"hi" else if(p>0.4)"mid" else "lo"
+ 
+# AI content generators
+genRecommendations <- function(rp, ak)
+ generateContent(paste0(
+   "You are a cardiologist. Provide 8 numbered, highly specific, actionable cardiovascular health ",
+   "recommendations for a patient with this profile: ", rp,
+   ". Each recommendation should include the medical rationale. Be warm, professional, and precise."), ak)
+ 
+genMealPlan <- function(rp, ak)
+ generateContent(paste0(
+   "Create a detailed 7-day heart-healthy meal plan for: ", rp,
+   ". Format:\nDAY 1:\n  Breakfast: ...\n  Lunch: ...\n  Dinner: ...\n  Snack: ...\n",
+   "Include calorie estimates and specify heart-healthy ingredients."), ak)
+ 
+genExercisePlan <- function(rp, age, ak)
+ generateContent(paste0(
+   "Create a safe 4-week progressive cardiovascular exercise plan for a ", age,
+   "-year-old with risk profile: ", rp,
+   ". Include: weekly schedule, exercise type, duration, heart rate zones, and safety warnings."), ak)
+ 
+genStory <- function(lvl, factors, name, ak)
+ generateContent(paste0(
+   "Write an empathetic, motivational 300-word health narrative for ", name,
+   " who has ", lvl, " cardiovascular risk. Key factors: ", paste(factors, collapse=", "),
+   ". Opening scenario → what risk means for daily life → 3 specific lifestyle changes ",
+   "with vivid description → inspiring call to action. Use second person (you/your). Warm, honest tone."), ak)
+ 
+genMedInfo <- function(rp, ak)
+ generateContent(paste0(
+   "Based on this cardiovascular risk profile: ", rp,
+   ", provide educational information (NOT prescriptions) about: ",
+   "1) Classes of medications commonly prescribed for these conditions, ",
+   "2) How they work, 3) Lifestyle alternatives. Emphasize consulting a doctor."), ak)
+ 
+# ─── SVG GENERATORS ────────────────────────────────────────────────────────────
+makeGaugeSVG <- function(prob) {
+ pct  <- round(prob * 100)
+ col  <- if(prob>0.65)"#ff4d6d" else if(prob>0.4)"#ff9f1c" else "#06d6a0"
+ ang  <- -90 + 180*prob
+ dl   <- 283; off <- dl - dl*prob
+ rl   <- riskLabel(prob)
+ sprintf('
+<svg viewBox="0 0 280 175" width="100%%" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+   <linearGradient id="ggrad" x1="0%%" y1="0%%" x2="100%%" y2="0%%">
+     <stop offset="0%%" stop-color="#06d6a0"/>
+     <stop offset="48%%" stop-color="#ff9f1c"/>
+     <stop offset="100%%" stop-color="#ff4d6d"/>
+   </linearGradient>
+   <filter id="gglow"><feGaussianBlur stdDeviation="3.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+   <radialGradient id="rg" cx="50%%" cy="80%%" r="60%%">
+     <stop offset="0%%" stop-color="%s" stop-opacity="0.18"/>
+     <stop offset="100%%" stop-color="%s" stop-opacity="0"/>
+   </radialGradient>
+ </defs>
+ <ellipse cx="140" cy="145" rx="110" ry="50" fill="url(#rg)"/>
+ <!-- Track -->
+ <path d="M28,145 A112,112 0 0,1 252,145" fill="none" stroke="#1e2d3d" stroke-width="20" stroke-linecap="round"/>
+ <!-- Value arc -->
+ <path d="M28,145 A112,112 0 0,1 252,145" fill="none" stroke="url(#ggrad)" stroke-width="20"
+       stroke-linecap="round" stroke-dasharray="%s" stroke-dashoffset="%s" filter="url(#gglow)"/>
+ <!-- Inner highlight -->
+ <path d="M28,145 A112,112 0 0,1 252,145" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="4"
+       stroke-linecap="round" stroke-dasharray="%s" stroke-dashoffset="%s"/>
+ <!-- Tick marks -->
+ <g stroke="#2a3f52" stroke-width="2">
+   <line x1="28" y1="145" x2="44" y2="145"/>
+   <line x1="61" y1="45" x2="72" y2="58"/>
+   <line x1="140" y1="33" x2="140" y2="48"/>
+   <line x1="219" y1="45" x2="208" y2="58"/>
+   <line x1="252" y1="145" x2="236" y2="145"/>
+ </g>
+ <!-- Tick labels -->
+ <text x="20" y="165" fill="#3d5a6e" font-size="11" font-family="monospace">0</text>
+ <text x="56" y="38" fill="#3d5a6e" font-size="11" font-family="monospace">25</text>
+ <text x="128" y="26" fill="#3d5a6e" font-size="11" font-family="monospace">50</text>
+ <text x="208" y="38" fill="#3d5a6e" font-size="11" font-family="monospace">75</text>
+ <text x="248" y="165" fill="#3d5a6e" font-size="11" font-family="monospace">100</text>
+ <!-- Needle -->
+ <g transform="rotate(%s 140 145)">
+   <line x1="140" y1="145" x2="140" y2="48" stroke="%s" stroke-width="3" stroke-linecap="round" filter="url(#gglow)"/>
+   <line x1="140" y1="145" x2="140" y2="162" stroke="%s" stroke-width="2" stroke-linecap="round" opacity="0.35"/>
+ </g>
+ <circle cx="140" cy="145" r="10" fill="#0b1724" stroke="%s" stroke-width="2.5"/>
+ <circle cx="140" cy="145" r="4"  fill="%s"/>
+ <!-- Score text -->
+ <text x="140" y="128" text-anchor="middle" fill="%s" font-size="38" font-weight="700"
+       font-family="monospace" filter="url(#gglow)">%s</text>
+ <text x="140" y="143" text-anchor="middle" fill="#3d5a6e" font-size="10" font-family="monospace">RISK %%</text>
+ <!-- Badge -->
+ <rect x="95" y="154" width="90" height="20" rx="10" fill="%s1a" stroke="%s44" stroke-width="1"/>
+ <text x="140" y="168" text-anchor="middle" fill="%s" font-size="10" font-weight="700"
+       font-family="monospace">%s</text>
+</svg>',
+   col, col, dl, round(off,1), dl, round(off,1),
+   round(ang,1), col, col, col, col,
+   col, pct, col, col, col, rl)
+}
+ 
+makeBodyMapSVG <- function(prob, ht, db, smoke, active, bmi) {
+ hc <- if(prob>0.6)"#ff4d6d" else if(prob>0.35)"#ff9f1c" else "#06d6a0"
+ bc <- if(prob>0.55)"#ff9f1c" else "#06d6a0"
+ kc <- if(db=="High")"#ff9f1c" else "#06d6a0"
+ lc <- if(smoke==1)"#ff4d6d" else "#06d6a0"
+ ac <- if(ht=="High")"#ff4d6d" else "#06d6a0"
+ vc <- if(bmi>30)"#ff9f1c" else "#06d6a0"
+ 
+ ring <- function(cx,cy,r,col) sprintf(
+   '<circle cx="%s" cy="%s" r="%s" fill="%s06" stroke="%s" stroke-width="1" opacity="0.25"/>
+    <circle cx="%s" cy="%s" r="%s" fill="%s12" stroke="%s" stroke-width="1.5" opacity="0.55"/>
+    <circle cx="%s" cy="%s" r="%s" fill="%s28" stroke="%s" stroke-width="2"/>
+    <circle cx="%s" cy="%s" r="%s" fill="%s"/>',
+   cx,cy,r+12,col,col, cx,cy,r+6,col,col, cx,cy,r+2,col,col, cx,cy,r,col)
+ 
+ sprintf('
+<svg viewBox="0 0 250 310" width="100%%" xmlns="http://www.w3.org/2000/svg">
+ <defs><filter id="bgl"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+ <!-- Silhouette -->
+ <ellipse cx="125" cy="44" rx="29" ry="32" fill="#0f1e2d" stroke="#1e3347" stroke-width="1.5"/>
+ <rect x="107" y="71" width="36" height="22" rx="8" fill="#0f1e2d" stroke="#1e3347" stroke-width="1"/>
+ <path d="M72,93 Q56,99 52,140 L56,210 Q70,222 125,224 Q180,222 194,210 L198,140 Q194,99 178,93 Z" fill="#0f1e2d" stroke="#1e3347" stroke-width="1.5"/>
+ <path d="M72,96 Q44,103 38,140 Q32,176 40,202 Q46,216 57,213 Q64,202 66,180 Q70,148 75,128 Z" fill="#0f1e2d" stroke="#1e3347" stroke-width="1"/>
+ <path d="M178,96 Q206,103 212,140 Q218,176 210,202 Q204,216 193,213 Q186,202 184,180 Q180,148 175,128 Z" fill="#0f1e2d" stroke="#1e3347" stroke-width="1"/>
+ <path d="M82,222 Q76,254 74,280 Q72,300 84,308 Q96,311 100,298 Q104,272 107,244 L112,222 Z" fill="#0f1e2d" stroke="#1e3347" stroke-width="1"/>
+ <path d="M168,222 Q174,254 176,280 Q178,300 166,308 Q154,311 150,298 Q146,272 143,244 L138,222 Z" fill="#0f1e2d" stroke="#1e3347" stroke-width="1"/>
+ <!-- Organs -->
+ %s %s %s %s %s %s
+ <!-- Labels -->
+ <line x1="106" y1="113" x2="82" y2="104" stroke="%s" stroke-width="0.8" stroke-dasharray="3,2" opacity="0.6"/>
+ <text x="79" y="101" fill="%s" font-size="8" font-family="monospace" text-anchor="end">HEART</text>
+ <line x1="127" y1="50" x2="154" y2="40" stroke="%s" stroke-width="0.8" stroke-dasharray="3,2" opacity="0.6"/>
+ <text x="156" y="38" fill="%s" font-size="8" font-family="monospace">BRAIN</text>
+ <line x1="137" y1="150" x2="162" y2="142" stroke="%s" stroke-width="0.8" stroke-dasharray="3,2" opacity="0.6"/>
+ <text x="164" y="140" fill="%s" font-size="8" font-family="monospace">KIDNEY</text>
+ <line x1="113" y1="122" x2="82" y2="131" stroke="%s" stroke-width="0.8" stroke-dasharray="3,2" opacity="0.6"/>
+ <text x="80" y="129" fill="%s" font-size="8" font-family="monospace" text-anchor="end">LUNGS</text>
+ <line x1="120" y1="148" x2="82" y2="158" stroke="%s" stroke-width="0.8" stroke-dasharray="3,2" opacity="0.6"/>
+ <text x="80" y="156" fill="%s" font-size="8" font-family="monospace" text-anchor="end">LIVER</text>
+ <line x1="122" y1="185" x2="164" y2="178" stroke="%s" stroke-width="0.8" stroke-dasharray="3,2" opacity="0.6"/>
+ <text x="166" y="176" fill="%s" font-size="8" font-family="monospace">ARTERY</text>
+</svg>',
+   ring(108,113,9,hc), ring(124,50,9,bc), ring(135,150,7,kc),
+   ring(114,122,8,lc), ring(122,148,7,vc), ring(122,185,6,ac),
+   hc,hc, bc,bc, kc,kc, lc,lc, vc,vc, ac,ac)
+}
+ 
+makeECGSvg <- function(prob) {
+ amp <- round(prob * 55 + 12)
+ sprintf('
+<svg viewBox="0 0 420 60" width="100%%" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">
+ <defs>
+   <linearGradient id="ecgg" x1="0%%" y1="0%%" x2="100%%" y2="0%%">
+     <stop offset="0%%" stop-color="#06d6a0" stop-opacity="0"/>
+     <stop offset="30%%" stop-color="#06d6a0"/>
+     <stop offset="70%%" stop-color="#ff4d6d"/>
+     <stop offset="100%%" stop-color="#ff4d6d" stop-opacity="0"/>
+   </linearGradient>
+   <filter id="eg"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+ </defs>
+ <path d="M0,30 L50,30 L68,30 L78,10 L88,%s L98,30 L115,30 L180,30 L198,30 L208,14 L218,%s L228,30 L245,30 L310,30 L328,30 L338,12 L348,%s L358,30 L375,30 L420,30"
+       fill="none" stroke="url(#ecgg)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" filter="url(#eg)"/>
+ <text x="400" y="14" fill="#1e3347" font-size="9" font-family="monospace">LIVE</text>
+ <circle cx="406" cy="20" r="4" fill="#ff4d6d" opacity="0.9">
+   <animate attributeName="opacity" values="0.9;0.2;0.9" dur="1s" repeatCount="indefinite"/>
+ </circle>
+</svg>',
+   60-amp, 60-round(amp*0.85), 60-round(amp*0.7))
+}
+ 
+# ─── MASTER CSS ────────────────────────────────────────────────────────────────
+APP_CSS <- '
+@import url("https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500;700&family=Epilogue:wght@300;400;500;600&display=swap");
+ 
+:root {
+ /* Palette */
+ --bg0:      #060d16;
+ --bg1:      #0b1724;
+ --bg2:      #0f1e2d;
+ --bg3:      #142334;
+ --bg4:      #1a2d40;
+ --surface:  #1e3347;
+ --accent:   #06d6a0;
+ --accent2:  #0abde3;
+ --danger:   #ff4d6d;
+ --warn:     #ff9f1c;
+ --success:  #06d6a0;
+ --purple:   #9b5de5;
+ --text:     #dce8f0;
+ --text2:    #5a7d96;
+ --text3:    #2e4a5f;
+ --border:   #1a3347;
+ --border2:  #1e3d55;
+ /* Typography */
+ --font:  "Epilogue", sans-serif;
+ --mono:  "JetBrains Mono", monospace;
+ --head:  "Syne", sans-serif;
+ /* Tokens */
+ --rad:   14px;
+ --glow:  0 0 28px rgba(6,214,160,0.12);
+ --glowd: 0 0 28px rgba(255,77,109,0.12);
+ --gloww: 0 0 28px rgba(255,159,28,0.12);
+}
+ 
+/* ── Reset ── */
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+ 
+body, .container-fluid {
+ background: var(--bg0) !important;
+ color: var(--text) !important;
+ font-family: var(--font) !important;
+ margin: 0 !important; padding: 0 !important;
+ min-height: 100vh;
+}
+ 
+/* ── Animated grid backdrop ── */
+body::before {
+ content: "";
+ position: fixed; inset: 0; z-index: 0; pointer-events: none;
+ background-image:
+   linear-gradient(rgba(6,214,160,0.025) 1px, transparent 1px),
+   linear-gradient(90deg, rgba(6,214,160,0.025) 1px, transparent 1px);
+ background-size: 52px 52px;
+ mask-image: radial-gradient(ellipse 80% 80% at 50% 40%, black 40%, transparent 100%);
+}
+body::after {
+ content: "";
+ position: fixed; top: -30%; left: -10%;
+ width: 55%; height: 70%;
+ background: radial-gradient(ellipse, rgba(6,214,160,0.035) 0%, transparent 68%);
+ pointer-events: none; z-index: 0;
+}
+ 
+.container-fluid, .tab-content { position: relative; z-index: 1; }
+ 
+/* ── HEADER ── */
+.cvd-header {
+ display: flex; align-items: center; justify-content: space-between;
+ padding: 16px 30px 14px;
+ background: linear-gradient(180deg, rgba(6,214,160,0.06) 0%, transparent 100%);
+ border-bottom: 1px solid var(--border);
+ position: relative;
+}
+.cvd-header::after {
+ content: "";
+ position: absolute; bottom: -1px; left: 0;
+ width: 220px; height: 1px;
+ background: linear-gradient(90deg, var(--accent), transparent);
+}
+.cvd-logo {
+ display: flex; align-items: center; gap: 12px;
+ font-family: var(--head);
+ font-size: 1.75em; font-weight: 800;
+ letter-spacing: 0.08em;
+ background: linear-gradient(120deg, var(--accent) 0%, var(--accent2) 100%);
+ -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+ background-clip: text;
+}
+.cvd-logo-mark {
+ width: 40px; height: 40px;
+ background: linear-gradient(135deg, var(--accent), var(--accent2));
+ border-radius: 11px;
+ display: flex; align-items: center; justify-content: center;
+ font-size: 20px; box-shadow: 0 0 24px rgba(6,214,160,0.35);
+ -webkit-text-fill-color: initial;
+}
+.cvd-subtitle {
+ font-family: var(--mono); font-size: 0.68em; color: var(--text2);
+ letter-spacing: 0.1em; margin-top: 3px; font-weight: 300;
+}
+.cvd-status {
+ font-family: var(--mono); font-size: 0.73em; color: var(--text2);
+ display: flex; align-items: center; gap: 8px;
+}
+.status-pip {
+ width: 8px; height: 8px; border-radius: 50%;
+ background: var(--success); box-shadow: 0 0 10px var(--success);
+ animation: blink 2.2s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1;box-shadow:0 0 10px var(--success)} 50%{opacity:0.4;box-shadow:0 0 20px var(--success)} }
+ 
+/* ── TABS ── */
+.nav-tabs {
+ border-bottom: 1px solid var(--border) !important;
+ background: var(--bg1);
+ padding: 0 24px;
+ display: flex; gap: 0; overflow-x: auto;
+ scrollbar-width: none;
+}
+.nav-tabs::-webkit-scrollbar { display: none; }
+.nav-tabs .nav-link {
+ color: var(--text2) !important; border: none !important;
+ font-family: var(--mono) !important; font-size: 0.73em !important;
+ letter-spacing: 0.07em; padding: 15px 20px !important;
+ white-space: nowrap; border-radius: 0 !important;
+ position: relative; transition: color 0.22s;
+}
+.nav-tabs .nav-link::after {
+ content: ""; position: absolute; bottom: 0; left: 50%; right: 50%;
+ height: 2px; background: var(--accent);
+ box-shadow: 0 0 10px var(--accent);
+ transition: left 0.22s, right 0.22s;
+}
+.nav-tabs .nav-link:hover { color: var(--text) !important; background: rgba(6,214,160,0.04) !important; }
+.nav-tabs .nav-link.active { color: var(--accent) !important; background: transparent !important; }
+.nav-tabs .nav-link.active::after { left: 0; right: 0; }
+.tab-content { padding: 22px 28px; }
+ 
+/* ── CARDS ── */
+.card {
+ background: var(--bg2) !important;
+ border: 1px solid var(--border) !important;
+ border-radius: var(--rad) !important;
+ padding: 22px !important;
+ margin-bottom: 18px;
+ position: relative; overflow: hidden;
+ transition: border-color 0.28s, box-shadow 0.28s;
+}
+.card::before {
+ content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+ background: linear-gradient(90deg, transparent 0%, rgba(6,214,160,0.35) 50%, transparent 100%);
+ opacity: 0; transition: opacity 0.28s;
+}
+.card:hover { border-color: var(--border2) !important; box-shadow: var(--glow) !important; }
+.card:hover::before { opacity: 1; }
+ 
+/* Card title */
+.ct {
+ font-family: var(--mono); font-size: 0.7em; color: var(--text2);
+ letter-spacing: 0.12em; text-transform: uppercase;
+ margin-bottom: 18px;
+ display: flex; align-items: center; gap: 10px;
+}
+.ct::before {
+ content: ""; display: block; width: 3px; height: 16px;
+ background: linear-gradient(180deg, var(--accent), var(--accent2));
+ border-radius: 2px; box-shadow: 0 0 10px var(--accent);
+ flex-shrink: 0;
+}
+.ct-warn::before { background: linear-gradient(180deg, var(--warn), #ff6b00); box-shadow: 0 0 10px var(--warn); }
+.ct-danger::before { background: linear-gradient(180deg, var(--danger), #c90032); box-shadow: 0 0 10px var(--danger); }
+ 
+/* ── SECTION RULE ── */
+.srule {
+ display: flex; align-items: center; gap: 10px; margin: 10px 0 16px;
+ color: var(--text3); font-size: 0.67em; font-family: var(--mono);
+ letter-spacing: 0.1em; text-transform: uppercase;
+}
+.srule::before, .srule::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+ 
+/* ── KPI CARDS ── */
+.kpi-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.kpi-card {
+ flex: 1 1 130px;
+ background: var(--bg3);
+ border: 1px solid var(--border);
+ border-radius: 12px; padding: 16px 18px;
+ position: relative; overflow: hidden;
+ cursor: default; transition: transform 0.22s, border-color 0.22s, box-shadow 0.22s;
+}
+.kpi-card:hover { transform: translateY(-2px); border-color: var(--border2); }
+.kpi-card::after {
+ content: ""; position: absolute; bottom: 0; left: 0; right: 0;
+ height: 2px; border-radius: 0 0 12px 12px;
+}
+.kpi-hi::after  { background: var(--danger); box-shadow: 0 0 12px var(--danger); }
+.kpi-mid::after { background: var(--warn);   box-shadow: 0 0 12px var(--warn); }
+.kpi-lo::after  { background: var(--success); box-shadow: 0 0 12px var(--success); }
+.kpi-label {
+ font-family: var(--mono); font-size: 0.63em; color: var(--text2);
+ letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 6px;
+}
+.kpi-value { font-family: var(--head); font-size: 2em; font-weight: 800; line-height: 1; margin-bottom: 5px; }
+.kpi-badge {
+ display: inline-block; font-family: var(--mono);
+ font-size: 0.58em; padding: 3px 9px; border-radius: 20px; letter-spacing: 0.06em;
+}
+.badge-hi  { background: rgba(255,77,109,0.1);  color: var(--danger);  border: 1px solid rgba(255,77,109,0.22); }
+.badge-mid { background: rgba(255,159,28,0.1);  color: var(--warn);    border: 1px solid rgba(255,159,28,0.22); }
+.badge-lo  { background: rgba(6,214,160,0.1);   color: var(--success); border: 1px solid rgba(6,214,160,0.22); }
+ 
+/* ── VITALS MINI GRID ── */
+.vgrid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 16px; }
+.vgrid-item {
+ background: var(--bg3); border: 1px solid var(--border);
+ border-radius: 11px; padding: 13px 14px; text-align: center;
+ transition: border-color 0.22s;
+}
+.vgrid-item:hover { border-color: var(--border2); }
+.vgrid-label { font-family: var(--mono); font-size: 0.6em; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+.vgrid-value { font-family: var(--head); font-size: 1.55em; font-weight: 700; }
+.vgrid-unit  { font-family: var(--mono); font-size: 0.6em; color: var(--text3); margin-top: 2px; }
+ 
+/* ── ECG BAR ── */
+.ecg-bar {
+ background: var(--bg3); border: 1px solid var(--border);
+ border-radius: 11px; padding: 11px 16px;
+ margin-bottom: 16px; position: relative; overflow: hidden;
+}
+.ecg-bar::before {
+ content: "ECG MONITOR"; position: absolute;
+ top: 8px; right: 14px;
+ font-family: var(--mono); font-size: 0.6em; color: var(--text3); letter-spacing: 0.1em;
+}
+ 
+/* ── RISK BARS ── */
+.rbar-wrap { margin-bottom: 13px; }
+.rbar-lbl {
+ display: flex; justify-content: space-between;
+ font-family: var(--mono); font-size: 0.7em; color: var(--text2); margin-bottom: 5px;
+}
+.rbar-bg {
+ height: 7px; background: var(--bg3);
+ border-radius: 4px; overflow: hidden; border: 1px solid var(--border);
+}
+.rbar-fill {
+ height: 100%; border-radius: 4px;
+ transition: width 1.6s cubic-bezier(0.23,1,0.32,1);
+ position: relative;
+}
+.rbar-fill::after {
+ content: ""; position: absolute; right: 0; inset-block: 0;
+ width: 28px; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.18));
+}
+ 
+/* ── ALERT BANNER ── */
+.alert-strip {
+ border-radius: 11px; padding: 13px 16px; margin-bottom: 16px;
+ font-size: 0.84em; display: flex; gap: 12px; align-items: flex-start;
+}
+.alert-strip.hi  { background: rgba(255,77,109,0.07); border: 1px solid rgba(255,77,109,0.22); color: #ffaab8; }
+.alert-strip.mid { background: rgba(255,159,28,0.07); border: 1px solid rgba(255,159,28,0.22); color: #ffd490; }
+.alert-strip.lo  { background: rgba(6,214,160,0.07);  border: 1px solid rgba(6,214,160,0.22);  color: #9aecd8; }
+.alert-icon { font-size: 1.15em; flex-shrink: 0; margin-top: 1px; }
+ 
+/* ── INPUTS ── */
+.form-group { margin-bottom: 14px; }
+input[type="number"], input[type="text"], select, textarea, .form-control {
+ background: var(--bg3) !important; border: 1px solid var(--border) !important;
+ color: var(--text) !important; border-radius: 10px !important;
+ font-family: var(--mono) !important; font-size: 0.83em !important;
+ padding: 9px 14px !important; width: 100% !important;
+ transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+ outline: none !important; -webkit-appearance: none;
+}
+input:focus, select:focus, textarea:focus, .form-control:focus {
+ border-color: var(--accent) !important;
+ background: var(--bg4) !important;
+ box-shadow: 0 0 0 3px rgba(6,214,160,0.1) !important;
+}
+label { color: var(--text2) !important; font-family: var(--mono) !important; font-size: 0.7em !important; letter-spacing: 0.05em; margin-bottom: 5px; }
+select option { background: var(--bg3); color: var(--text); }
+ 
+/* ── BUTTONS ── */
+.btn, button:not(.dt-button), .action-button {
+ background: transparent !important;
+ border: 1px solid var(--border) !important;
+ color: var(--text) !important;
+ border-radius: 10px !important;
+ font-family: var(--mono) !important; font-size: 0.78em !important;
+ padding: 9px 20px !important;
+ cursor: pointer !important; transition: all 0.22s !important;
+ letter-spacing: 0.04em; position: relative; overflow: hidden;
+}
+.btn:hover, button:not(.dt-button):hover, .action-button:hover {
+ border-color: var(--accent) !important; color: var(--accent) !important;
+ box-shadow: 0 0 18px rgba(6,214,160,0.12) !important;
+ transform: translateY(-1px) !important;
+}
+.btn:active { transform: translateY(0) !important; }
+ 
+.btn-primary {
+ background: linear-gradient(130deg, var(--accent), var(--accent2)) !important;
+ color: #04111e !important; border: none !important; font-weight: 600 !important;
+ box-shadow: 0 4px 22px rgba(6,214,160,0.22) !important;
+}
+.btn-primary:hover {
+ background: linear-gradient(130deg, #09f8bb, #0fd4f5) !important;
+ color: #04111e !important;
+ box-shadow: 0 6px 32px rgba(6,214,160,0.38) !important;
+ transform: translateY(-2px) !important;
+}
+.btn-secondary { background: var(--bg3) !important; border-color: var(--border2) !important; }
+.btn-danger {
+ background: linear-gradient(130deg, var(--danger), #c90032) !important;
+ color: white !important; border: none !important;
+ box-shadow: 0 4px 22px rgba(255,77,109,0.22) !important;
+}
+ 
+/* ── PRE / VERBATIM ── */
+pre, .shiny-text-output {
+ background: var(--bg3) !important; border: 1px solid var(--border) !important;
+ color: var(--accent) !important; border-radius: 10px !important;
+ padding: 16px !important; font-family: var(--mono) !important;
+ font-size: 0.77em !important; white-space: pre-wrap; word-break: break-word;
+ line-height: 1.75;
+}
+ 
+/* ── CHATBOX ── */
+#chatbox {
+ background: var(--bg3); border: 1px solid var(--border);
+ border-radius: 12px; height: 420px; overflow-y: auto; padding: 18px;
+}
+.chat-msg { margin-bottom: 16px; animation: fadeup 0.3s ease-out; }
+@keyframes fadeup { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+.chat-msg .role {
+ font-family: var(--mono); font-size: 0.62em; color: var(--text3);
+ margin-bottom: 5px; letter-spacing: 0.1em; text-transform: uppercase;
+}
+.chat-msg.user   .content {
+ background: var(--bg4); border: 1px solid var(--border);
+ border-radius: 12px 12px 4px 12px; padding: 10px 15px;
+ font-size: 0.87em; line-height: 1.65; max-width: 88%; margin-left: auto;
+}
+.chat-msg.assistant .content {
+ background: rgba(6,214,160,0.048); border: 1px solid rgba(6,214,160,0.16);
+ border-radius: 4px 12px 12px 12px; padding: 10px 15px;
+ color: #9ae8d6; font-size: 0.87em; line-height: 1.65; max-width: 88%;
+}
+.chat-input-row {
+ display: flex; gap: 10px; margin-top: 14px;
+ background: var(--bg3); border: 1px solid var(--border);
+ border-radius: 12px; padding: 12px 14px; align-items: flex-end;
+}
+.chat-input-row textarea {
+ flex: 1; background: transparent !important; border: none !important;
+ padding: 2px 0 !important; resize: none; font-size: 0.86em !important;
+}
+.chat-input-row textarea:focus { box-shadow: none !important; }
+ 
+/* ── STORY CARD ── */
+.story-shell {
+ background: linear-gradient(140deg, rgba(6,214,160,0.045), rgba(10,189,227,0.045));
+ border: 1px solid rgba(6,214,160,0.14); border-radius: 14px;
+ padding: 24px; position: relative; overflow: hidden;
+}
+.story-shell::before {
+ content: "\201C"; position: absolute; top:-28px; left:14px;
+ font-size:9em; color:rgba(6,214,160,0.055); font-family:Georgia,serif;
+ line-height:1; pointer-events:none;
+}
+.story-text { white-space:pre-wrap; font-size:0.87em; line-height:1.9; color:var(--text2); }
+ 
+/* ── DATATABLES ── */
+.dataTables_wrapper { color: var(--text) !important; }
+.dataTables_wrapper * { background: transparent !important; color: var(--text) !important; border-color: var(--border) !important; }
+table.dataTable { background: var(--bg2) !important; border-radius: 9px; overflow: hidden; }
+table.dataTable thead th {
+ background: var(--bg3) !important; border-bottom: 1px solid var(--border) !important;
+ font-family: var(--mono) !important; font-size: 0.7em !important; color: var(--text2) !important;
+ padding: 12px !important; text-transform: uppercase; letter-spacing: 0.07em;
+}
+table.dataTable tbody td {
+ padding: 10px 12px !important; font-size: 0.82em !important; border-bottom: 1px solid var(--border) !important;
+}
+table.dataTable tbody tr:hover td { background: var(--bg3) !important; }
+.dataTables_filter input, .dataTables_length select {
+ background: var(--bg3) !important; border: 1px solid var(--border) !important;
+ color: var(--text) !important; border-radius: 8px !important;
+ padding: 6px 10px !important; font-size: 0.8em !important;
+}
+.dataTables_info, .dataTables_paginate { font-size: 0.77em !important; }
+.paginate_button { background: var(--bg3) !important; border: 1px solid var(--border) !important; border-radius: 6px !important; color: var(--text) !important; margin: 0 2px !important; }
+.paginate_button.current { background: var(--accent) !important; color: #04111e !important; border-color: var(--accent) !important; }
+ 
+/* ── LAYOUT HELPERS ── */
+.panel-pair { display: flex; gap: 16px; flex-wrap: wrap; }
+.panel-pair > .card { flex: 1 1 260px; }
+.gauge-card, .bmap-card { min-height: 290px; }
+ 
+/* ── MODEL COMPARISON TABLE ── */
+.mct { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:0.8em; }
+.mct thead th { background:var(--bg3) !important; padding:11px; color:var(--text2); text-align:left; border-bottom:1px solid var(--border); font-size:0.85em; letter-spacing:0.07em; text-transform:uppercase; }
+.mct tbody td { padding:11px; border-bottom:1px solid var(--border); }
+.mct tbody tr:hover td { background:var(--bg3) !important; }
+.mct-best { background:rgba(6,214,160,0.04) !important; }
+ 
+/* ── METRICS PILL ── */
+.mpill {
+ display:inline-flex; align-items:center; gap:6px;
+ background:var(--bg3); border:1px solid var(--border);
+ border-radius:20px; padding:5px 12px;
+ font-family:var(--mono); font-size:0.7em; color:var(--text2);
+ margin:3px; transition:all 0.2s; cursor:default;
+}
+.mpill:hover { border-color:var(--accent); color:var(--accent); }
+.mpill-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+ 
+/* ── LOADING SCREEN ── */
+#cvd-loading {
+ position: fixed; inset: 0; background: var(--bg0); z-index: 9999;
+ display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px;
+ transition: opacity 0.5s;
+}
+.cvd-spinner {
+ width: 52px; height: 52px;
+ border: 2px solid var(--border);
+ border-top-color: var(--accent);
+ border-radius: 50%;
+ animation: spin 0.75s linear infinite;
+ box-shadow: 0 0 24px rgba(6,214,160,0.18);
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.cvd-loading-text { font-family: var(--mono); font-size: 0.8em; color: var(--text2); letter-spacing: 0.12em; }
+.cvd-loading-sub  { font-family: var(--mono); font-size: 0.65em; color: var(--text3); letter-spacing: 0.08em; }
+ 
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+ 
+/* ── MISC ── */
+hr { border: none !important; border-top: 1px solid var(--border) !important; margin: 18px 0; }
+.shiny-notification { background: var(--bg3) !important; border: 1px solid var(--border) !important; color: var(--text) !important; border-radius: 10px !important; font-family: var(--mono) !important; }
+.shiny-plot-output { border-radius: 10px; overflow: hidden; }
+.radio label { color: var(--text2) !important; font-size: 0.82em !important; }
+.radio input[type="radio"] { accent-color: var(--accent); }
+.fade-in { animation: fadein 0.4s ease-out; }
+@keyframes fadein { from{opacity:0} to{opacity:1} }
+.slide-up { animation: slideup 0.38s ease-out; }
+@keyframes slideup { from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:translateY(0)} }
+ 
+/* ── REPORT LAYOUT ── */
+.report-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:22px; }
+.report-score { font-family:var(--head); font-size:3em; font-weight:800; line-height:1; }
+.report-meta  { font-family:var(--mono); font-size:0.7em; color:var(--text2); margin-top:5px; line-height:1.8; }
+ 
+/* ── QUICK PROMPT BUTTONS ── */
+.qpbtn {
+ display:block; width:100%; text-align:left;
+ font-family:var(--mono) !important; font-size:0.73em !important;
+ padding:9px 14px !important;
+ background:var(--bg3) !important; border-color:var(--border) !important;
+ border-radius:9px !important; margin-bottom:6px !important;
+ color:var(--text2) !important; transition:all 0.2s !important;
+}
+.qpbtn:hover {
+ background:var(--bg4) !important; border-color:var(--accent) !important;
+ color:var(--accent) !important; transform:none !important;
+}
+ 
+/* ── RESPONSIVE ── */
+@media(max-width:768px){
+ .cvd-header{padding:12px 16px;}
+ .tab-content{padding:14px 16px;}
+ .kpi-card{flex:1 1 calc(50% - 6px);}
+ .panel-pair>.card{flex:1 1 100%;}
+ .vgrid{grid-template-columns:repeat(2,1fr);}
+}
+'
+ 
+# ─── JS ────────────────────────────────────────────────────────────────────────
+APP_JS <- '
+// Voice recognition
+var recognition = null;
+function initVoice(){
+ if(!recognition){
+   var SRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+   if(SRec){
+     recognition = new SRec();
+     recognition.continuous = false; recognition.lang = "en-US"; recognition.interimResults = false;
+     recognition.onresult = function(e){ Shiny.setInputValue("voice_text", e.results[0][0].transcript, {priority:"event"}); };
+     recognition.onerror  = function(e){ console.warn("Voice error:", e.error); };
+   }
+ }
+}
+Shiny.addCustomMessageHandler("startVoice", function(m){ initVoice(); if(recognition) recognition.start(); });
+Shiny.addCustomMessageHandler("stopVoice",  function(m){ if(recognition) recognition.stop(); });
+Shiny.addCustomMessageHandler("speakText",  function(m){
+ if("speechSynthesis" in window){ speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(m)); }
+});
+Shiny.addCustomMessageHandler("printPage", function(m){ window.print(); });
+ 
+// Auto-scroll chatbox
+Shiny.addCustomMessageHandler("scrollChat", function(m){
+ var cb = document.getElementById("chatbox");
+ if(cb) cb.scrollTop = cb.scrollTop + 9999;
+});
+ 
+// Loading overlay
+document.addEventListener("DOMContentLoaded", function(){
+ setTimeout(function(){
+   var overlay = document.getElementById("cvd-loading");
+   if(overlay){ overlay.style.opacity="0"; setTimeout(function(){ overlay.style.display="none"; }, 520); }
+ }, 1600);
+});
+'
+ 
+# ─── UI ────────────────────────────────────────────────────────────────────────
+ui <- tagList(
+ tags$script(HTML(APP_JS)),
+ fluidPage(
+   useShinyjs(),
+   tags$head(
+     tags$style(HTML(APP_CSS)),
+     tags$script(src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"),
+     tags$meta(name="viewport", content="width=device-width, initial-scale=1")
+   ),
+ 
+   # Loading overlay
+   div(id="cvd-loading",
+     div(class="cvd-spinner"),
+     div(class="cvd-loading-text", "INITIALISING"),
+     div(class="cvd-loading-sub",  "CVD RISK INTELLIGENCE PLATFORM v3.0")
+   ),
+ 
+   # ── Header ──────────────────────────────────────────────────────────────
+   div(class="cvd-header",
+     div(class="cvd-logo",
+       div(class="cvd-logo-mark", HTML("&#10084;")),
+       div(
+         div("CVD ANALYTICA"),
+         div(class="cvd-subtitle", "CARDIOVASCULAR RISK INTELLIGENCE PLATFORM")
+       )
+     ),
+     div(class="cvd-status",
+       div(class="status-pip"),
+       "SYSTEM ONLINE  |  AI READY"
+     )
+   ),
+ 
+   tabsetPanel(id="main_tabs", type="tabs",
+ 
+     # ── Tab 1: Patient & Predict ───────────────────────────────────────
+     tabPanel("⬡ PATIENT",
+       fluidRow(
+         column(4,
+           div(class="card",
+             div(class="ct", "PATIENT INPUT"),
+             textInput("name", "Patient Name", "Patient"),
+             div(class="srule", "DEMOGRAPHICS"),
+             fluidRow(
+               column(6, numericInput("age",    "Age (yrs)",   50, 1, 120)),
+               column(6, selectInput("gender",  "Sex", c("Female"=1,"Male"=2)))
+             ),
+             fluidRow(
+               column(6, numericInput("height", "Height (cm)", 170, 100, 220)),
+               column(6, numericInput("weight", "Weight (kg)",  70,  30, 200))
+             ),
+             div(class="srule", "BLOOD PRESSURE"),
+             fluidRow(
+               column(6, numericInput("ap_hi", "Systolic",  120, 60, 250)),
+               column(6, numericInput("ap_lo", "Diastolic",  80, 40, 150))
+             ),
+             div(class="srule", "BIOMARKERS"),
+             selectInput("cholesterol","Cholesterol",
+               c("Normal (<200 mg/dL)"=1,"Above Normal (200–239)"=2,"High (≥240 mg/dL)"=3)),
+             selectInput("gluc","Blood Glucose",
+               c("Normal (<100 mg/dL)"=1,"Pre-diabetic (100–125)"=2,"Diabetic (≥126)"=3)),
+             div(class="srule", "LIFESTYLE"),
+             fluidRow(
+               column(4, selectInput("smoke",  "Smoking",  c("No"=0,"Yes"=1))),
+               column(4, selectInput("alco",   "Alcohol",  c("No"=0,"Yes"=1))),
+               column(4, selectInput("active", "Exercise", c("No"=0,"Yes"=1)))
+             ),
+             div(class="srule", "UPLOAD DATASET"),
+             fileInput("file", "Upload .CSV dataset", accept=".csv"),
+             actionButton("predict", "⬡  RUN ANALYSIS",
+               class="btn-primary",
+               style="width:100%;margin-top:10px;padding:13px !important;font-size:0.85em !important;")
+           )
+         ),
+         column(8,
+           uiOutput("vitals_grid"),
+           uiOutput("kpi_row"),
+           div(class="ecg-bar", uiOutput("ecg_svg")),
+           div(class="panel-pair",
+             div(class="card gauge-card",
+               div(class="ct","RISK GAUGE"),
+               uiOutput("gauge_svg"),
+               uiOutput("framingham_ui")
+             ),
+             div(class="card bmap-card",
+               div(class="ct","ORGAN RISK MAP"),
+               uiOutput("body_map_svg"),
+               div(style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;",
+                 tags$span(class="mpill", div(class="mpill-dot",style="background:var(--danger)"), "High"),
+                 tags$span(class="mpill", div(class="mpill-dot",style="background:var(--warn)"),   "Moderate"),
+                 tags$span(class="mpill", div(class="mpill-dot",style="background:var(--success)"),"Low")
+               )
+             )
+           ),
+           uiOutput("risk_alert"),
+           div(class="card",
+             div(class="ct","RISK FACTOR BREAKDOWN"),
+             uiOutput("risk_bars")
+           )
+         )
+       )
+     ),
+ 
+     # ── Tab 2: Dataset ───────────────────────────────────────────────
+     tabPanel("⬡ DATASET",
+       div(class="card",
+         div(class="ct","DATASET EXPLORER"),
+         uiOutput("dataset_kpis"),
+         hr(),
+         DTOutput("dataTable")
+       )
+     ),
+ 
+     # ── Tab 3: Models ────────────────────────────────────────────────
+     tabPanel("⬡ MODELS",
+       tabsetPanel(type="tabs",
+         tabPanel("Logistic Regression",
+           div(class="card",
+             div(class="ct","LOGISTIC REGRESSION"),
+             fluidRow(
+               column(6, div(class="ct","MODEL SUMMARY"), verbatimTextOutput("logreg_summary")),
+               column(6, div(class="ct","CONFUSION MATRIX"), verbatimTextOutput("logreg_metrics"))
+             ),
+             hr(), plotOutput("logreg_roc", height="290px")
+           )
+         ),
+         tabPanel("Random Forest",
+           div(class="card",
+             div(class="ct","RANDOM FOREST"),
+             fluidRow(
+               column(6, div(class="ct","MODEL OUTPUT"), verbatimTextOutput("rf_summary")),
+               column(6, div(class="ct","CONFUSION MATRIX"), verbatimTextOutput("rf_metrics"))
+             ),
+             hr(), plotOutput("rf_roc", height="290px")
+           )
+         ),
+         tabPanel("XGBoost",
+           div(class="card",
+             div(class="ct","XGBOOST"),
+             fluidRow(
+               column(6, div(class="ct","MODEL OUTPUT"), verbatimTextOutput("xgb_summary")),
+               column(6, div(class="ct","CONFUSION MATRIX"), verbatimTextOutput("xgb_metrics"))
+             ),
+             hr(), plotOutput("xgb_roc", height="290px")
+           )
+         ),
+         tabPanel("AUC Comparison",
+           div(class="card",
+             div(class="ct","MODEL PERFORMANCE — AUC COMPARISON"),
+             tags$canvas(id="aucChart", style="width:100%;height:310px;"),
+             hr(),
+             uiOutput("auc_table"),
+             tags$script(HTML('
+               Shiny.addCustomMessageHandler("drawAUC", function(d){
+                 if(window._aucChart) window._aucChart.destroy();
+                 var ctx = document.getElementById("aucChart");
+                 window._aucChart = new Chart(ctx, {
+                   type:"bar",
+                   data:{
+                     labels: d.labels,
+                     datasets:[{
+                       label:"AUC Score", data: d.values,
+                       backgroundColor: d.values.map(function(v){
+                         return v>=0.8?"rgba(6,214,160,0.25)":v>=0.7?"rgba(255,159,28,0.25)":"rgba(255,77,109,0.25)";
+                       }),
+                       borderColor: d.values.map(function(v){
+                         return v>=0.8?"#06d6a0":v>=0.7?"#ff9f1c":"#ff4d6d";
+                       }),
+                       borderWidth:2, borderRadius:10
+                     }]
+                   },
+                   options:{
+                     responsive:true, maintainAspectRatio:false,
+                     animation:{duration:1800, easing:"easeOutElastic"},
+                     plugins:{
+                       legend:{display:false},
+                       tooltip:{backgroundColor:"#0f1e2d",borderColor:"#1a3347",borderWidth:1,
+                                titleColor:"#dce8f0",bodyColor:"#5a7d96",padding:14,
+                                callbacks:{label:function(c){return " AUC: "+c.raw.toFixed(4);}}}
+                     },
+                     scales:{
+                       x:{grid:{color:"#1a3347"},ticks:{color:"#5a7d96",font:{family:"JetBrains Mono",size:12}}},
+                       y:{grid:{color:"#1a3347"},ticks:{color:"#5a7d96",font:{family:"JetBrains Mono",size:11}},min:0.5,max:1.0}
+                     }
+                   }
+                 });
+               });
+             '))
+           )
+         ),
+         tabPanel("Feature Importance",
+           div(class="card",
+             div(class="ct","FEATURE IMPORTANCE — RANDOM FOREST"),
+             plotOutput("feat_imp", height="310px"),
+             hr(),
+             div(class="ct","CORRELATION HEATMAP"),
+             plotOutput("corr_plot", height="290px")
+           )
+         )
+       )
+     ),
+ 
+     # ── Tab 4: AI Chat ───────────────────────────────────────────────
+     tabPanel("⬡ AI CHAT",
+       fluidRow(
+         column(3,
+           div(class="card",
+             div(class="ct","SETTINGS"),
+             radioButtons("tts","Text-to-Speech",c("On"=TRUE,"Off"=FALSE),selected=FALSE,inline=TRUE),
+             hr(),
+             div(style="display:flex;gap:8px;",
+               actionButton("start_voice","🎤 Voice",style="flex:1"),
+               actionButton("stop_voice","⏹",style="flex:1")
+             ),
+             hr(),
+             div(class="ct","QUICK PROMPTS"),
+             actionButton("qp1","What does my risk score mean?",class="qpbtn"),
+             actionButton("qp2","Foods to avoid for my heart",class="qpbtn"),
+             actionButton("qp3","How to lower blood pressure naturally",class="qpbtn"),
+             actionButton("qp4","Safe exercises for my risk level",class="qpbtn"),
+             actionButton("qp5","Warning signs I should watch for",class="qpbtn"),
+             hr(),
+             div(class="ct","SESSION"),
+             uiOutput("chat_stats")
+           )
+         ),
+         column(9,
+           div(class="card",
+             div(class="ct","AI HEALTH ASSISTANT"),
+             div(id="chatbox", uiOutput("chat_msgs")),
+             div(class="chat-input-row",
+               textAreaInput("chat_input","","",rows=2,
+                 placeholder="Ask anything about your cardiovascular health…"),
+               actionButton("send_chat","↑",class="btn-primary",
+                 style="width:46px;height:46px;padding:0 !important;font-size:1.3em;flex-shrink:0;")
+             ),
+             hr(),
+             div(class="ct","CONVERSATION LOG"),
+             DTOutput("chat_log")
+           )
+         )
+       )
+     ),
+ 
+     # ── Tab 5: AI Plans ──────────────────────────────────────────────
+     tabPanel("⬡ AI PLANS",
+       tabsetPanel(type="tabs",
+         tabPanel("Recommendations",
+           div(class="card",
+             div(class="ct","AI HEALTH RECOMMENDATIONS"),
+             p("Personalised, AI-generated cardiovascular health recommendations.",
+               style="color:var(--text2);font-size:.84em;margin-bottom:16px;"),
+             div(style="display:flex;gap:10px;flex-wrap:wrap;",
+               actionButton("gen_rec","⬡  Generate Recommendations",class="btn-primary"),
+               downloadButton("dl_rec","↓ PDF Report",class="btn-secondary")
+             ),
+             hr(), uiOutput("rec_display")
+           )
+         ),
+         tabPanel("Meal Plan",
+           div(class="card",
+             div(class="ct","7-DAY HEART-HEALTHY MEAL PLAN"),
+             p("AI-generated nutrition plan based on your cardiovascular risk profile.",
+               style="color:var(--text2);font-size:.84em;margin-bottom:16px;"),
+             actionButton("gen_meals","⬡  Generate Meal Plan",class="btn-primary"),
+             hr(), verbatimTextOutput("meal_txt")
+           )
+         ),
+         tabPanel("Exercise Plan",
+           div(class="card",
+             div(class="ct","4-WEEK PROGRESSIVE EXERCISE PLAN"),
+             p("Safe, personalised cardiovascular exercise programme.",
+               style="color:var(--text2);font-size:.84em;margin-bottom:16px;"),
+             actionButton("gen_ex","⬡  Generate Exercise Plan",class="btn-primary"),
+             hr(), verbatimTextOutput("ex_txt")
+           )
+         ),
+         tabPanel("Medication Info",
+           div(class="card",
+             div(class="ct","MEDICATION EDUCATION"),
+             div(class="alert-strip mid",
+               div(class="alert-icon","◈"),
+               div("This is educational information only — not a prescription. Always consult your doctor before starting or changing any medication.")
+             ),
+             actionButton("gen_meds","⬡  Learn About Common Medications",class="btn-primary"),
+             hr(), verbatimTextOutput("med_txt")
+           )
+         )
+       )
+     ),
+ 
+     # ── Tab 6: Sentiment ─────────────────────────────────────────────
+     tabPanel("⬡ SENTIMENT",
+       div(class="card",
+         div(class="ct","RECOMMENDATION TONE ANALYSIS"),
+         fluidRow(
+           column(6, div(class="ct","AI TONE PROFILE"), verbatimTextOutput("tone_txt")),
+           column(6, div(class="ct","NRC EMOTION SCORES"), verbatimTextOutput("nrc_txt"))
+         ),
+         hr(),
+         div(class="ct","EMOTION INTENSITY CHART"),
+         plotOutput("emotion_plot", height="240px"),
+         hr(),
+         div(class="ct","CHAT SENTIMENT TIMELINE"),
+         plotOutput("sent_timeline", height="200px")
+       )
+     ),
+ 
+     # ── Tab 7: Story ──────────────────────────────────────────────────
+     tabPanel("⬡ STORY",
+       div(class="card",
+         div(class="ct","PERSONALISED HEALTH NARRATIVE"),
+         p("A compelling, empathetic story to motivate your health journey.",
+           style="color:var(--text2);font-size:.84em;margin-bottom:16px;"),
+         actionButton("gen_story","⬡  Generate My Health Story",class="btn-primary"),
+         hr(),
+         uiOutput("story_badge"),
+         div(class="story-shell", uiOutput("story_body"))
+       )
+     ),
+ 
+     # ── Tab 8: Risk Report ────────────────────────────────────────────
+     tabPanel("⬡ REPORT",
+       div(class="card",
+         div(class="ct","COMPREHENSIVE RISK REPORT"),
+         uiOutput("full_report"),
+         hr(),
+         div(style="display:flex;gap:10px;flex-wrap:wrap;",
+           downloadButton("dl_report","↓ Download PDF",class="btn-primary"),
+           actionButton("print_btn","⎙ Print",class="btn-secondary")
+         )
+       )
+     ),
+ 
+     # ── Tab 9: Feedback ───────────────────────────────────────────────
+     tabPanel("⬡ FEEDBACK",
+       div(class="card",
+         div(class="ct","POST-SESSION QUESTIONNAIRE"),
+         p("Help us improve your experience.",
+           style="color:var(--text2);font-size:.84em;margin-bottom:18px;"),
+         uiOutput("q_ui"),
+         actionButton("submit_q","Submit Feedback",class="btn-primary",style="margin-top:14px;"),
+         hr(),
+         verbatimTextOutput("q_thanks")
+       )
+     )
+   )
+ )
+)
+ 
+# ─── SERVER ────────────────────────────────────────────────────────────────────
+server <- function(input, output, session) {
+ 
+ # ── Reactive state ────────────────────────────────────────────────────────
+ rv_data      <- reactive({
+   req(input$file)
+   df <- read.csv(input$file$datapath, sep=";")
+   df$age    <- round(df$age / 365)
+   df$cardio <- as.factor(df$cardio)
+   df
+ })
+ rv_logreg   <- reactiveVal(); rv_rf   <- reactiveVal(); rv_xgb   <- reactiveVal()
+ rv_lg_sum   <- reactiveVal(); rv_lg_met <- reactiveVal()
+ rv_rf_sum   <- reactiveVal(); rv_rf_met <- reactiveVal()
+ rv_xg_sum   <- reactiveVal(); rv_xg_met <- reactiveVal()
+ roc_rv      <- reactiveValues(lr=NULL, rf=NULL, xgb=NULL)
+ rv_prob     <- reactiveVal(0)
+ rv_ht       <- reactiveVal("—"); rv_db <- reactiveVal("—")
+ rv_risk_str <- reactiveVal(NULL)
+ rv_rec      <- reactiveValues(text=NULL)
+ rv_ep       <- reactiveVal(NULL)
+ rv_story    <- reactiveVal(NULL)
+ rv_meals    <- reactiveVal(NULL)
+ rv_ex       <- reactiveVal(NULL)
+ rv_meds     <- reactiveVal(NULL)
+ chat_df     <- reactiveVal(data.frame(
+   role=character(), message=character(),
+   sent_score=double(), sent_label=character(),
+   stringsAsFactors=FALSE
+ ))
+ 
+ # ── Train models ────────────────────────────────────────────────────────────
+ observeEvent(input$file, {
+   req(rv_data())
+   showNotification("Training models… this may take a moment.", duration=NULL, id="train_n", type="message")
+   df <- rv_data(); set.seed(42)
+   idx  <- createDataPartition(df$cardio, p=.8, list=FALSE)
+   tr <- df[idx,]; te <- df[-idx,]
+   feats <- c("age","gender","height","weight","ap_hi","ap_lo","cholesterol","gluc","smoke","alco","active")
+ 
+   # Logistic regression
+   lr <- glm(cardio~., data=tr[,c(feats,"cardio")], family=binomial)
+   rv_logreg(lr); rv_lg_sum(capture.output(summary(lr)))
+   p_lr <- predict(lr, te, type="response"); pr_lr <- ifelse(p_lr>.5,1,0)
+   cm_lr <- confusionMatrix(factor(pr_lr), factor(te$cardio))
+   rv_lg_met(capture.output(cm_lr))
+   roc_rv$lr <- roc(as.numeric(as.character(te$cardio)), p_lr)
+ 
+   # Random Forest
+   rf <- randomForest(as.factor(cardio)~., data=tr, ntree=100, importance=TRUE)
+   rv_rf(rf); rv_rf_sum(capture.output(print(rf)))
+   p_rf  <- predict(rf, te, type="prob")[,2]; pr_rf <- predict(rf, te)
+   cm_rf <- confusionMatrix(pr_rf, te$cardio)
+   rv_rf_met(capture.output(cm_rf))
+   roc_rv$rf <- roc(as.numeric(as.character(te$cardio)), p_rf)
+ 
+   # XGBoost
+   mkDM <- function(d) xgb.DMatrix(data=as.matrix(d[,feats]), label=as.numeric(as.character(d$cardio)))
+   xgb  <- xgb.train(list(objective="binary:logistic",eval_metric="logloss",max_depth=4,eta=.08,subsample=0.8),
+                     data=mkDM(tr), nrounds=60, verbose=0)
+   rv_xgb(xgb); rv_xg_sum(capture.output(print(xgb)))
+   p_xgb  <- predict(xgb, mkDM(te)); pr_xgb <- ifelse(p_xgb>.5,1,0)
+   cm_xgb <- confusionMatrix(factor(pr_xgb), te$cardio)
+   rv_xg_met(capture.output(cm_xgb))
+   roc_rv$xgb <- roc(as.numeric(as.character(te$cardio)), p_xgb)
+ 
+   session$sendCustomMessage("drawAUC", list(
+     labels = c("Logistic Regression","Random Forest","XGBoost"),
+     values = c(round(auc(roc_rv$lr),4), round(auc(roc_rv$rf),4), round(auc(roc_rv$xgb),4))
+   ))
+   removeNotification("train_n")
+   showNotification("Models trained successfully!", duration=3, type="message")
+ })
+ 
+ output$dataTable <- renderDT({
+   req(input$file)
+   datatable(rv_data(), options=list(pageLength=10,scrollX=TRUE), class="display compact")
+ })
+ 
+ output$dataset_kpis <- renderUI({
+   req(input$file); df <- rv_data()
+   n <- nrow(df); pct <- round(mean(df$cardio==1)*100,1)
+   div(class="kpi-row",
+     div(class="kpi-card kpi-lo",
+       div(class="kpi-label","RECORDS"),
+       div(class="kpi-value",style="color:var(--success)",format(n,big.mark=",")),
+       div(class="kpi-badge badge-lo","LOADED")),
+     div(class="kpi-card kpi-hi",
+       div(class="kpi-label","CVD POSITIVE"),
+       div(class="kpi-value",style="color:var(--danger)",paste0(pct,"%")),
+       div(class="kpi-badge badge-hi","CASES")),
+     div(class="kpi-card kpi-lo",
+       div(class="kpi-label","FEATURES"),
+       div(class="kpi-value",style="color:var(--accent)","11"),
+       div(class="kpi-badge badge-lo","VARS")),
+     div(class="kpi-card kpi-mid",
+       div(class="kpi-label","MEAN AGE"),
+       div(class="kpi-value",style="color:var(--warn)",round(mean(df$age),1)),
+       div(class="kpi-badge badge-mid","YRS"))
+   )
+ })
+ 
+ # ── Prediction ────────────────────────────────────────────────────────────
+ observeEvent(input$predict, {
+   nd <- data.frame(
+     age=input$age, gender=as.numeric(input$gender),
+     height=input$height, weight=input$weight,
+     ap_hi=input$ap_hi, ap_lo=input$ap_lo,
+     cholesterol=as.numeric(input$cholesterol),
+     gluc=as.numeric(input$gluc), smoke=as.numeric(input$smoke),
+     alco=as.numeric(input$alco), active=as.numeric(input$active)
+   )
+   prob <- if (!is.null(rv_logreg())) {
+     predict(rv_logreg(), nd, type="response")
+   } else {
+     s <- 0
+     if(nd$ap_hi>140) s <- s+0.22
+     if(nd$cholesterol>1) s <- s+(nd$cholesterol-1)*0.14
+     if(nd$age>50) s <- s+(nd$age-50)*0.009
+     if(nd$smoke==1) s <- s+0.14
+     if(nd$gluc>1) s <- s+0.12
+     if(nd$active==0) s <- s+0.08
+     pmin(s, 0.97)
+   }
+   ht <- predictHypertension(nd); db <- predictDiabetes(nd)
+   rv_prob(prob); rv_ht(ht); rv_db(db)
+   rv_risk_str(paste0(
+     "Patient: ",input$name,", Age: ",input$age,
+     ", CVD Probability: ",round(prob*100,1),"%, ",
+     "Hypertension: ",ht,", Diabetes Risk: ",db,
+     ", BMI: ",calcBMI(input$weight,input$height),
+     ", Systolic BP: ",input$ap_hi,", Diastolic BP: ",input$ap_lo,
+     ", Cholesterol: ",c("Normal","Elevated","High")[as.numeric(input$cholesterol)],
+     ", Glucose: ",c("Normal","Pre-diabetic","Diabetic")[as.numeric(input$gluc)],
+     ", Smoker: ",ifelse(input$smoke==1,"Yes","No"),
+     ", Alcohol: ",ifelse(input$alco==1,"Yes","No"),
+     ", Physically Active: ",ifelse(input$active==1,"Yes","No")
+   ))
+ })
+ 
+ # ── Vitals grid ──────────────────────────────────────────────────────────
+ output$vitals_grid <- renderUI({
+   bmi  <- calcBMI(input$weight, input$height)
+   bmi_c <- bmiColor(bmi)
+   bp_c  <- if(input$ap_hi>140)"var(--danger)" else if(input$ap_hi>130)"var(--warn)" else "var(--success)"
+   vi <- function(lbl, val, unit, col)
+     div(class="vgrid-item",
+       div(class="vgrid-label", lbl),
+       div(class="vgrid-value", style=paste0("color:",col), val),
+       div(class="vgrid-unit", unit))
+   div(class="vgrid",
+     vi("Systolic BP",  input$ap_hi, "mmHg", bp_c),
+     vi("Diastolic BP", input$ap_lo, "mmHg", "var(--accent2)"),
+     vi("BMI",         bmi, bmiCategory(bmi), bmi_c),
+     vi("Age",         input$age, "years",     "var(--text)"),
+     vi("Weight",      input$weight, "kg",     "var(--text)"),
+     vi("Height",      input$height, "cm",     "var(--text)")
+   )
+ })
+ 
+ # ── KPI row ──────────────────────────────────────────────────────────────
+ output$kpi_row <- renderUI({
+   p <- rv_prob(); ht <- rv_ht(); db <- rv_db()
+   bmi <- calcBMI(input$weight, input$height)
+   mk <- function(lbl, val, cls, badge, col)
+     div(class=paste0("kpi-card kpi-",cls),
+       div(class="kpi-label", lbl),
+       div(class="kpi-value", style=paste0("color:",col), val),
+       div(class=paste0("kpi-badge badge-",cls), badge))
+   div(class="kpi-row",
+     mk("CVD RISK",     paste0(round(p*100),"%"), riskClass(p), riskLabel(p), riskColor(p)),
+     mk("HYPERTENSION", ht, if(ht=="High")"hi" else "lo",
+        if(ht=="High")"ALERT" else if(ht=="Low")"CLEAR" else "—",
+        if(ht=="High")"var(--danger)" else "var(--success)"),
+     mk("DIABETES RISK", db, if(db=="High")"hi" else "lo",
+        if(db=="High")"ALERT" else if(db=="Low")"CLEAR" else "—",
+        if(db=="High")"var(--warn)" else "var(--success)"),
+     mk("BMI", bmi, if(bmi>30)"hi" else if(bmi>25)"mid" else "lo",
+        bmiCategory(bmi), bmiColor(bmi))
+   )
+ })
+ 
+ # ── ECG / Gauge / Body map ───────────────────────────────────────────────
+ output$ecg_svg      <- renderUI({ HTML(makeECGSvg(rv_prob())) })
+ output$gauge_svg    <- renderUI({ HTML(makeGaugeSVG(rv_prob())) })
+ output$body_map_svg <- renderUI({
+   HTML(makeBodyMapSVG(rv_prob(), rv_ht(), rv_db(),
+                       as.numeric(input$smoke), as.numeric(input$active),
+                       calcBMI(input$weight, input$height)))
+ })
+ 
+ # ── Framingham ───────────────────────────────────────────────────────────
+ output$framingham_ui <- renderUI({
+   fs <- calcFramingham(input$age, as.numeric(input$gender),
+                        as.numeric(input$cholesterol), input$ap_hi, as.numeric(input$smoke))
+   col <- if(fs>0.2)"var(--danger)" else if(fs>0.1)"var(--warn)" else "var(--success)"
+   div(style="text-align:center;margin-top:10px;padding:11px;background:var(--bg3);border-radius:9px;border:1px solid var(--border);",
+     div(style="font-family:var(--mono);font-size:0.62em;color:var(--text2);margin-bottom:3px;","FRAMINGHAM 10-YR SCORE"),
+     div(style=paste0("font-family:var(--head);font-size:1.9em;font-weight:800;color:",col), paste0(round(fs*100,1),"%"))
+   )
+ })
+ 
+ # ── Risk alert ───────────────────────────────────────────────────────────
+ output$risk_alert <- renderUI({
+   p <- rv_prob()
+   if(p==0) return(NULL)
+   cls <- riskClass(p)
+   icon <- if(p>0.65)"⚠" else if(p>0.4)"◈" else "✓"
+   msg  <- if(p>0.65)
+     "<strong>High Cardiovascular Risk Detected.</strong> Your score indicates elevated risk. Please consult a healthcare professional promptly. See the AI Plans tab for personalised guidance."
+   else if(p>0.4)
+     "<strong>Moderate Risk Identified.</strong> Multiple modifiable risk factors found. Targeted lifestyle changes can meaningfully reduce your risk."
+   else
+     "<strong>Low Risk Profile.</strong> Your cardiovascular health appears well-managed. Continue your healthy habits and monitor annually."
+   div(class=paste0("alert-strip ",cls), div(class="alert-icon",icon), div(HTML(msg)))
+ })
+ 
+ # ── Risk bars ────────────────────────────────────────────────────────────
+ output$risk_bars <- renderUI({
+   factors <- list(
+     list("Systolic BP",
+          if(input$ap_hi>140)90 else if(input$ap_hi>130)56 else 20,
+          if(input$ap_hi>140)"#ff4d6d" else if(input$ap_hi>130)"#ff9f1c" else "#06d6a0",
+          paste0(input$ap_hi," mmHg")),
+     list("Cholesterol",
+          switch(as.character(input$cholesterol),"1"=18,"2"=62,"3"=92,18),
+          if(input$cholesterol==3)"#ff4d6d" else if(input$cholesterol==2)"#ff9f1c" else "#06d6a0",
+          c("Normal","Elevated","High")[as.numeric(input$cholesterol)]),
+     list("Age Factor",
+          min(round(input$age/105*90),95),
+          if(input$age>60)"#ff4d6d" else if(input$age>45)"#ff9f1c" else "#06d6a0",
+          paste0(input$age," yrs")),
+     list("Body Weight",
+          min(max(round((input$weight-40)/140*95),5),95),
+          if(input$weight>90)"#ff4d6d" else if(input$weight>75)"#ff9f1c" else "#06d6a0",
+          paste0(input$weight," kg")),
+     list("Blood Glucose",
+          switch(as.character(input$gluc),"1"=14,"2"=58,"3"=90,14),
+          if(input$gluc==3)"#ff4d6d" else if(input$gluc==2)"#ff9f1c" else "#06d6a0",
+          c("Normal","Pre-DM","Diabetic")[as.numeric(input$gluc)]),
+     list("Inactivity",
+          if(input$active==0)72 else 10,
+          if(input$active==0)"#ff9f1c" else "#06d6a0",
+          if(input$active==0)"Sedentary" else "Active"),
+     list("Smoking",
+          if(input$smoke==1)86 else 5,
+          if(input$smoke==1)"#ff4d6d" else "#06d6a0",
+          if(input$smoke==1)"Smoker" else "Non-smoker"),
+     list("Alcohol",
+          if(input$alco==1)44 else 7,
+          if(input$alco==1)"#ff9f1c" else "#06d6a0",
+          if(input$alco==1)"Regular" else "None")
+   )
+   do.call(tagList, lapply(factors, function(f)
+     div(class="rbar-wrap",
+       div(class="rbar-lbl",
+         tags$span(f[[1]]),
+         tags$span(style=paste0("color:",f[[3]]), f[[4]])),
+       div(class="rbar-bg",
+         div(class="rbar-fill",
+           style=paste0("width:",f[[2]],"%%;background:",f[[3]],";box-shadow:0 0 10px ",f[[3]],"44")))
+     )
+   ))
+ })
+ 
+ # ── Model outputs ─────────────────────────────────────────────────────────
+ output$logreg_summary <- renderText({ req(rv_lg_sum()); paste(rv_lg_sum(),collapse="\n") })
+ output$logreg_metrics  <- renderText({ req(rv_lg_met()); paste(rv_lg_met(),collapse="\n") })
+ output$rf_summary      <- renderText({ req(rv_rf_sum()); paste(rv_rf_sum(),collapse="\n") })
+ output$rf_metrics      <- renderText({ req(rv_rf_met()); paste(rv_rf_met(),collapse="\n") })
+ output$xgb_summary     <- renderText({ req(rv_xg_sum()); paste(rv_xg_sum(),collapse="\n") })
+ output$xgb_metrics     <- renderText({ req(rv_xg_met()); paste(rv_xg_met(),collapse="\n") })
+ 
+ # ── ROC plot factory ────────────────────────────────────────────────────────
+ rocTheme <- function() {
+   theme_minimal() + theme(
+     plot.background  = element_rect(fill="#0b1724",color=NA),
+     panel.background = element_rect(fill="#0b1724",color=NA),
+     panel.grid.major = element_line(color="#111e2b",linewidth=0.5),
+     panel.grid.minor = element_blank(),
+     text             = element_text(color="#5a7d96",family="mono"),
+     axis.text        = element_text(color="#2e4a5f",size=9),
+     plot.title       = element_text(color="#dce8f0",size=11,face="bold"),
+     axis.title       = element_text(color="#5a7d96",size=9),
+     plot.margin      = margin(14,14,14,14)
+   )
+ }
+ plotROC <- function(roc_obj, col, lbl) {
+   req(roc_obj)
+   df <- data.frame(x=1-roc_obj$specificities, y=roc_obj$sensitivities)
+   ggplot(df,aes(x,y)) +
+     geom_ribbon(aes(ymin=0,ymax=y), fill=col, alpha=0.07) +
+     geom_line(color=col, linewidth=1.5) +
+     geom_abline(linetype="dashed",color="#1a3347",linewidth=0.8) +
+     geom_point(data=df[seq(1,nrow(df),length.out=20),],
+                aes(x,y), color=col, size=1.6, alpha=0.7) +
+     labs(title=paste0(lbl,"  |  AUC = ",round(auc(roc_obj),4)),
+          x="1 – Specificity (FPR)", y="Sensitivity (TPR)") +
+     rocTheme()
+ }
+ output$logreg_roc <- renderPlot({ plotROC(roc_rv$lr, "#06d6a0","Logistic Regression") }, bg="#0b1724")
+ output$rf_roc     <- renderPlot({ plotROC(roc_rv$rf, "#ff9f1c","Random Forest") },       bg="#0b1724")
+ output$xgb_roc    <- renderPlot({ plotROC(roc_rv$xgb,"#ff4d6d","XGBoost") },             bg="#0b1724")
+ 
+ # ── AUC comparison table ────────────────────────────────────────────────────
+ output$auc_table <- renderUI({
+   req(roc_rv$lr)
+   vals <- c(round(auc(roc_rv$lr),4), round(auc(roc_rv$rf),4), round(auc(roc_rv$xgb),4))
+   nms  <- c("Logistic Regression","Random Forest","XGBoost")
+   cols <- c("#06d6a0","#ff9f1c","#ff4d6d")
+   best <- which.max(vals)
+   tags$table(class="mct",
+     tags$thead(tags$tr(
+       tags$th("MODEL"), tags$th("AUC SCORE"), tags$th("BAR"), tags$th("STATUS")
+     )),
+     tags$tbody(lapply(seq_along(vals), function(i)
+       tags$tr(class=if(i==best)"mct-best" else "",
+         tags$td(if(i==best) tags$strong(style=paste0("color:",cols[i]),nms[i]) else nms[i]),
+         tags$td(style=paste0("color:",cols[i],";font-weight:700;font-family:var(--mono);"), vals[i]),
+         tags$td(div(style=paste0("height:4px;width:",round(vals[i]*100),"px;background:",cols[i],";border-radius:2px;max-width:100%;"))),
+         tags$td(div(class=if(i==best)"kpi-badge badge-lo" else "kpi-badge badge-mid", if(i==best)"BEST" else "GOOD"))
+       )
+     ))
+   )
+ })
+ 
+ # ── Feature importance ──────────────────────────────────────────────────────
+ output$feat_imp <- renderPlot({
+   req(rv_rf())
+   imp <- importance(rv_rf())
+   df  <- data.frame(feature=rownames(imp), imp=imp[,"MeanDecreaseGini"])
+   df  <- df[order(df$imp),]
+   df$feature <- factor(df$feature, levels=df$feature)
+   ggplot(df,aes(feature,imp,fill=imp)) +
+     geom_col(show.legend=FALSE,width=0.66) +
+     geom_text(aes(label=round(imp,1)),hjust=-0.18,color="#5a7d96",size=3,family="mono") +
+     scale_fill_gradient(low="#06d6a022",high="#06d6a0") +
+     coord_flip() +
+     labs(title="Feature Importance — Mean Decrease Gini",x=NULL,y="Importance") +
+     rocTheme()
+ }, bg="#0b1724")
+ 
+ output$corr_plot <- renderPlot({
+   req(input$file)
+   df <- rv_data()
+   nm <- df[,sapply(df,is.numeric)]
+   if(ncol(nm)<2) return(NULL)
+   cm <- cor(nm, use="complete.obs")
+   cl <- melt(cm)
+   ggplot(cl,aes(Var1,Var2,fill=value)) +
+     geom_tile(color="#0b1724",linewidth=0.4) +
+     geom_text(aes(label=round(value,2)),color="#dce8f0",size=2.7,family="mono") +
+     scale_fill_gradient2(low="#ff4d6d",mid="#111e2b",high="#06d6a0",midpoint=0) +
+     labs(title="Feature Correlation Heatmap",x=NULL,y=NULL,fill="r") +
+     rocTheme() +
+     theme(axis.text.x=element_text(angle=45,hjust=1),
+           legend.background=element_rect(fill="#0b1724",color=NA),
+           legend.text=element_text(color="#5a7d96"))
+ }, bg="#0b1724")
+ 
+ # ── Chat ─────────────────────────────────────────────────────────────────
+ doChat <- function(msg) {
+   df  <- chat_df()
+   ctx <- if(!is.null(rv_risk_str()))
+     paste0("You are an empathetic cardiovascular health assistant. Patient context: ",
+            rv_risk_str(), "\nProvide accurate, supportive, actionable guidance. Be concise but thorough.\n\n")
+   else "You are a helpful cardiovascular health assistant. Give accurate, empathetic guidance.\n\n"
+   prompt <- paste0(ctx, paste0(df$role,": ",df$message,collapse="\n"), "\nUser: ", msg)
+   u_s  <- mean(sentiment(msg)$sentiment)
+   u_lbl <- if(u_s>.05)"Positive" else if(u_s<-.05)"Negative" else "Neutral"
+   df <- rbind(df, data.frame(role="user",message=msg,
+                              sent_score=round(u_s,3),sent_label=u_lbl,stringsAsFactors=FALSE))
+   chat_df(df)
+   bot <- generateContent(prompt, CHATBOT_API_KEY)
+   btxt <- if(bot$ok) bot$text else paste0("[Error] ",bot$text)
+   b_s  <- mean(sentiment(btxt)$sentiment)
+   b_lbl <- if(b_s>.05)"Positive" else if(b_s<-.05)"Negative" else "Neutral"
+   df <- rbind(df, data.frame(role="assistant",message=btxt,
+                              sent_score=round(b_s,3),sent_label=b_lbl,stringsAsFactors=FALSE))
+   chat_df(df)
+   updateTextAreaInput(session,"chat_input",value="")
+   if(isTRUE(as.logical(input$tts))) session$sendCustomMessage("speakText",btxt)
+   session$sendCustomMessage("scrollChat",list())
+ }
+ 
+ observeEvent(input$send_chat,  { req(nchar(trimws(input$chat_input))>0); doChat(input$chat_input) })
+ observeEvent(input$qp1, doChat("What does my cardiovascular risk score actually mean for my life expectancy?"))
+ observeEvent(input$qp2, doChat("What specific foods should I avoid to protect my heart?"))
+ observeEvent(input$qp3, doChat("How can I lower my blood pressure without medication?"))
+ observeEvent(input$qp4, doChat("What exercises are safe and beneficial given my current risk level?"))
+ observeEvent(input$qp5, doChat("What warning signs should I watch for that would require immediate medical attention?"))
+ observeEvent(input$start_voice, session$sendCustomMessage("startVoice",list()))
+ observeEvent(input$stop_voice,  session$sendCustomMessage("stopVoice",list()))
+ observeEvent(input$voice_text,  { updateTextAreaInput(session,"chat_input",value=input$voice_text) })
+ 
+ output$chat_msgs <- renderUI({
+   df <- chat_df()
+   if(nrow(df)==0) return(
+     div(style="text-align:center;padding:48px;color:var(--text3);",
+       div(style="font-size:2.2em;margin-bottom:14px;","💬"),
+       div(style="font-family:var(--mono);font-size:0.78em;line-height:1.8;",
+         "Ask your AI health assistant anything", tags$br(),
+         "about cardiovascular health, your risk factors,", tags$br(),
+         "medications, diet, or exercise.")))
+   do.call(tagList, lapply(seq_len(nrow(df)), function(i)
+     div(class=paste0("chat-msg ",df$role[i]),
+       div(class="role", if(df$role[i]=="user") paste0("YOU  •  ",df$sent_label[i]) else "AI HEALTH ASSISTANT"),
+       div(class="content", df$message[i]))
+   ))
+ })
+ 
+ output$chat_log  <- renderDT({
+   df <- chat_df(); if(nrow(df)==0) return(NULL)
+   datatable(df, colnames=c("Role","Message","Sentiment Score","Sentiment"),
+             options=list(pageLength=5,scrollX=TRUE), class="display compact")
+ })
+ 
+ output$chat_stats <- renderUI({
+   df <- chat_df()
+   n   <- nrow(df)
+   avg <- if(n>0) round(mean(df$sent_score,na.rm=TRUE),3) else 0
+   col <- if(avg>0)"var(--success)" else if(avg<0)"var(--danger)" else "var(--text3)"
+   div(
+     tags$span(class="mpill", div(class="mpill-dot",style="background:var(--accent)"), paste0(n," messages")),
+     tags$span(class="mpill", div(class="mpill-dot",style=paste0("background:",col)),  paste0("Avg: ",avg))
+   )
+ })
+ 
+ # ── Recommendations ──────────────────────────────────────────────────────
+ observeEvent(input$gen_rec, {
+   req(rv_risk_str())
+   showNotification("Generating recommendations…", duration=NULL, id="rec_n")
+   res <- genRecommendations(rv_risk_str(), CHATBOT_API_KEY)
+   removeNotification("rec_n")
+   txt <- if(res$ok) res$text else paste0("[Error] ",res$text)
+   rv_rec$text <- txt
+   output$rec_display <- renderUI({
+     div(class="fade-in",
+       div(style="white-space:pre-wrap;font-family:var(--mono);font-size:0.8em;line-height:1.85;
+                  color:var(--accent);background:var(--bg3);border:1px solid var(--border);
+                  border-radius:10px;padding:20px;", txt))
+   })
+   # Emotion analysis
+   ae <- generateContent(paste0(
+     "Analyze the emotional tone of this health text. Provide concise bullet-point analysis of: ",
+     "positivity, empathy, motivation, clarity, urgency.\n\n",txt), CHATBOT_API_KEY)
+   if(ae$ok) {
+     nrc <- get_nrc_sentiment(txt)
+     scores <- sapply(c("joy","sadness","anger","fear","trust","disgust","surprise","anticipation"),
+                      function(e) sum(nrc[[e]]))
+     rv_ep(list(para=ae$text, scores=scores))
+   }
+   updateTabsetPanel(session,"main_tabs",selected="⬡ SENTIMENT")
+ })
+ 
+ output$tone_txt <- renderText({
+   ep <- rv_ep()
+   if(is.null(ep)) "Generate recommendations first to see tone analysis." else ep$para
+ })
+ output$nrc_txt <- renderText({
+   ep <- rv_ep()
+   if(is.null(ep)) "Awaiting analysis…" else
+     paste0(paste0(toupper(names(ep$scores)),": ",round(ep$scores,2)), collapse="\n")
+ })
+ output$emotion_plot <- renderPlot({
+   ep <- rv_ep(); if(is.null(ep)) return(NULL)
+   df <- data.frame(e=toupper(names(ep$scores)), s=as.numeric(ep$scores))
+   df <- df[order(df$s,decreasing=TRUE),]; df$e <- factor(df$e,levels=df$e)
+   ggplot(df,aes(e,s,fill=s)) +
+     geom_col(show.legend=FALSE,width=0.64) +
+     geom_text(aes(label=round(s,1)),vjust=-0.4,color="#5a7d96",size=3,family="mono") +
+     scale_fill_gradient(low="#06d6a022",high="#06d6a0") +
+     labs(title="NRC Emotion Intensity",x=NULL,y="Score") +
+     rocTheme()
+ }, bg="#0b1724")
+ 
+ output$sent_timeline <- renderPlot({
+   df <- chat_df(); if(nrow(df)<2) return(NULL)
+   df$idx <- seq_len(nrow(df))
+   ggplot(df,aes(idx,sent_score,color=role,group=1)) +
+     geom_hline(yintercept=0,linetype="dashed",color="#1a3347") +
+     geom_line(linewidth=1.1,alpha=0.85) +
+     geom_point(size=2.8) +
+     scale_color_manual(values=c(user="#06d6a0",assistant="#9b5de5")) +
+     labs(title="Chat Sentiment Timeline",x="Message",y="Score",color=NULL) +
+     rocTheme() +
+     theme(legend.background=element_rect(fill="#0b1724",color=NA),
+           legend.text=element_text(color="#5a7d96"))
+ }, bg="#0b1724")
+ 
+ output$dl_rec <- downloadHandler(
+   filename=function() paste0("CVD_Recommendations_",Sys.Date(),".pdf"),
+   content=function(file) {
+     req(rv_rec$text)
+     tmp <- tempfile(fileext=".Rmd")
+     writeLines(c(
+       "---",
+       paste0("title: 'Cardiovascular Health Recommendations'"),
+       paste0("subtitle: 'Patient: ",input$name,"  |  ",Sys.Date(),"'"),
+       "output: pdf_document","---","",
+       if(!is.null(rv_risk_str())) paste0("> **Profile:** ",rv_risk_str()) else "",
+       "","## Personalised Recommendations","",rv_rec$text
+     ), con=tmp)
+     rmarkdown::render(tmp, output_file=file, quiet=TRUE)
+   }
+ )
+ 
+ # ── Meal plan ────────────────────────────────────────────────────────────
+ observeEvent(input$gen_meals, {
+   req(rv_risk_str())
+   showNotification("Creating meal plan…",duration=NULL,id="meal_n")
+   res <- genMealPlan(rv_risk_str(), CHATBOT_API_KEY)
+   removeNotification("meal_n")
+   rv_meals(if(res$ok) res$text else paste0("[Error] ",res$text))
+   output$meal_txt <- renderText({ rv_meals() })
+ })
+ 
+ # ── Exercise plan ────────────────────────────────────────────────────────
+ observeEvent(input$gen_ex, {
+   req(rv_risk_str())
+   showNotification("Building exercise plan…",duration=NULL,id="ex_n")
+   res <- genExercisePlan(rv_risk_str(), input$age, CHATBOT_API_KEY)
+   removeNotification("ex_n")
+   rv_ex(if(res$ok) res$text else paste0("[Error] ",res$text))
+   output$ex_txt <- renderText({ rv_ex() })
+ })
+ 
+ # ── Medication info ──────────────────────────────────────────────────────
+ observeEvent(input$gen_meds, {
+   req(rv_risk_str())
+   showNotification("Fetching medication education…",duration=NULL,id="med_n")
+   res <- genMedInfo(rv_risk_str(), CHATBOT_API_KEY)
+   removeNotification("med_n")
+   rv_meds(if(res$ok) res$text else paste0("[Error] ",res$text))
+   output$med_txt <- renderText({ rv_meds() })
+ })
+ 
+ # ── Story ─────────────────────────────────────────────────────────────────
+ observeEvent(input$gen_story, {
+   p   <- rv_prob()
+   lvl <- if(p>.65)"High" else if(p>.4)"Moderate" else "Low"
+   col <- if(lvl=="High")"var(--danger)" else if(lvl=="Moderate")"var(--warn)" else "var(--success)"
+   fac <- c(
+     if(input$ap_hi>140)"Elevated systolic blood pressure",
+     if(input$age>50)paste0("Age ",input$age),
+     if(input$weight>80)paste0("Weight ",input$weight,"kg"),
+     if(input$gluc>1)c("Normal","Pre-diabetic","Diabetic")[as.numeric(input$gluc)]
+                       ,
+     if(input$smoke==1)"Active smoker",
+     if(input$active==0)"Sedentary lifestyle"
+   )
+   if(length(fac)==0) fac <- "generally healthy profile"
+   showNotification("Crafting your story…",duration=NULL,id="story_n")
+   res <- genStory(lvl, fac, input$name, CHATBOT_API_KEY)
+   removeNotification("story_n")
+   rv_story(if(res$ok) res$text else paste0("[Error] ",res$text))
+   pct <- if(lvl=="High")88 else if(lvl=="Moderate")54 else 18
+   output$story_badge <- renderUI({
+     div(class="slide-up",
+       style="text-align:center;margin-bottom:18px;padding:20px;background:var(--bg3);border-radius:12px;border:1px solid var(--border);",
+       div(style=paste0("display:inline-block;width:110px;height:110px;border-radius:50%;",
+         "background:",col,"14;border:2px solid ",col,";",
+         "line-height:110px;font-family:var(--head);font-size:1.1em;font-weight:700;color:",col),
+         paste0(lvl," Risk")),
+       div(style="width:65%;height:6px;background:var(--border);border-radius:3px;margin:14px auto 0;overflow:hidden;",
+         div(style=paste0("width:",pct,"%;height:100%;background:",col,";border-radius:3px;box-shadow:0 0 12px ",col)))
+     )
+   })
+   output$story_body <- renderUI({
+     div(class="fade-in story-text", rv_story())
+   })
+ })
+ 
+ # ── Full report ───────────────────────────────────────────────────────────
+ output$full_report <- renderUI({
+   p   <- rv_prob(); bmi <- calcBMI(input$weight,input$height)
+   col <- riskColor(p); lbl <- riskLabel(p)
+   fs  <- calcFramingham(input$age,as.numeric(input$gender),
+                         as.numeric(input$cholesterol),input$ap_hi,as.numeric(input$smoke))
+   div(class="slide-up",
+     div(class="report-header",
+       div(
+         div(style="font-family:var(--head);font-size:1.7em;font-weight:800;color:var(--text);",
+             "CARDIOVASCULAR RISK ASSESSMENT REPORT"),
+         div(class="report-meta",
+           paste0("Patient: ",input$name), tags$br(),
+           paste0("Date: ",Sys.Date()," | Generated by CVD Analytica v3.0"))
+       ),
+       div(class="report-score",style=paste0("color:",col), paste0(round(p*100),"%"))
+     ),
+     hr(),
+     div(class="ct","DEMOGRAPHICS"),
+     div(class="kpi-row",
+       div(class="kpi-card",div(class="kpi-label","NAME"),      div(style="font-size:1em;font-weight:600;",input$name)),
+       div(class="kpi-card",div(class="kpi-label","AGE"),       div(class="kpi-value",input$age)),
+       div(class="kpi-card",div(class="kpi-label","SEX"),       div(style="font-size:1em;font-weight:600;",if(input$gender==1)"Female" else "Male")),
+       div(class="kpi-card",div(class="kpi-label","BMI"),       div(class="kpi-value",bmi))
+     ),
+     div(class="ct","CLINICAL READINGS"),
+     div(class="vgrid",
+       div(class="vgrid-item",div(class="vgrid-label","Systolic BP"),
+           div(class="vgrid-value",style=if(input$ap_hi>140)"color:var(--danger)" else "color:var(--success)",input$ap_hi),div(class="vgrid-unit","mmHg")),
+       div(class="vgrid-item",div(class="vgrid-label","Diastolic"),
+           div(class="vgrid-value",input$ap_lo),div(class="vgrid-unit","mmHg")),
+       div(class="vgrid-item",div(class="vgrid-label","Cholesterol"),
+           div(class="vgrid-value",c("Normal","Elevated","High")[as.numeric(input$cholesterol)]),div(class="vgrid-unit","level")),
+       div(class="vgrid-item",div(class="vgrid-label","Glucose"),
+           div(class="vgrid-value",c("Normal","Pre-DM","Diabetic")[as.numeric(input$gluc)]),div(class="vgrid-unit","level")),
+       div(class="vgrid-item",div(class="vgrid-label","Smoking"),
+           div(class="vgrid-value",style=if(input$smoke==1)"color:var(--danger)" else "color:var(--success)",if(input$smoke==1)"YES" else "NO"),div(class="vgrid-unit","status")),
+       div(class="vgrid-item",div(class="vgrid-label","Active"),
+           div(class="vgrid-value",style=if(input$active==1)"color:var(--success)" else "color:var(--warn)",if(input$active==1)"YES" else "NO"),div(class="vgrid-unit","status"))
+     ),
+     div(class="ct","RISK SUMMARY"),
+     div(class=paste0("alert-strip ",riskClass(p)),
+       div(class="alert-icon","⬡"),
+       div(
+         div(style=paste0("font-weight:700;color:",col,";margin-bottom:5px;font-size:1.05em;"),
+             paste0("10-Year CVD Risk: ",round(p*100,1),"% — ",lbl)),
+         div(style="font-size:0.85em;color:var(--text2);line-height:1.8;",
+             paste0("Hypertension Risk: ",rv_ht()," | Diabetes Risk: ",rv_db()),tags$br(),
+             paste0("BMI: ",bmi," (",bmiCategory(bmi),") | Framingham Score: ",round(fs*100,1),"%"))
+       )
+     )
+   )
+ })
+ 
+ output$dl_report <- downloadHandler(
+   filename=function() paste0("CVD_Report_",gsub(" ","_",input$name),"_",Sys.Date(),".pdf"),
+   content=function(file) {
+     p   <- rv_prob(); bmi <- calcBMI(input$weight,input$height)
+     tmp <- tempfile(fileext=".Rmd")
+     lines <- c(
+       "---", paste0("title: 'CVD Risk Report — ",input$name,"'"),
+       paste0("date: '",Sys.Date(),"'"), "output: pdf_document","---","",
+       paste0("## Patient Profile"),"",
+       paste0("- **Name:** ",input$name),
+       paste0("- **Age:** ",input$age," years"),
+       paste0("- **Sex:** ",if(input$gender==1)"Female" else "Male"),
+       paste0("- **BMI:** ",bmi," — ",bmiCategory(bmi)),
+       paste0("- **Systolic BP:** ",input$ap_hi," mmHg"),
+       paste0("- **Diastolic BP:** ",input$ap_lo," mmHg"),"",
+       "## Risk Assessment","",
+       paste0("**10-Year CVD Risk:** ",round(p*100,1),"% — ",riskLabel(p)),
+       paste0("**Hypertension Risk:** ",rv_ht()),
+       paste0("**Diabetes Risk:** ",rv_db()),"",
+       if(!is.null(rv_rec$text)) c("## Personalised Recommendations","",rv_rec$text) else ""
+     )
+     writeLines(lines, con=tmp)
+     rmarkdown::render(tmp, output_file=file, quiet=TRUE)
+   }
+ )
+ observeEvent(input$print_btn, session$sendCustomMessage("printPage",list()))
+ 
+ # ── Questionnaire ────────────────────────────────────────────────────────
+ qs <- reactiveVal(NULL)
+ observeEvent(input$main_tabs, {
+   if(input$main_tabs=="⬡ FEEDBACK") {
+     res <- generateContent(
+       "Generate exactly 5 thoughtful open-ended questions to assess a patient's understanding and readiness to implement cardiovascular health recommendations. Number 1-5. Be empathetic and practical.",
+       CHATBOT_API_KEY)
+     if(res$ok) {
+       ql <- trimws(unlist(strsplit(res$text,"\n+")))
+       ql <- ql[nchar(ql)>5]
+       qs(ql[1:min(5,length(ql))])
+     } else {
+       qs(c(
+         "1. What was the most important insight you gained from your risk assessment today?",
+         "2. Which recommendations do you feel most confident about implementing first?",
+         "3. What specific barriers might prevent you from following these recommendations?",
+         "4. How do you plan to track and measure your cardiovascular health progress?",
+         "5. What additional support or information do you need to make these changes?"
+       ))
+     }
+   }
+ })
+ 
+ output$q_ui <- renderUI({
+   req(qs())
+   div(class="fade-in",
+     p(style="color:var(--text2);font-size:.84em;margin-bottom:18px;",
+       "Your responses help personalise your health journey and improve our platform."),
+     do.call(tagList, lapply(seq_along(qs()), function(i)
+       div(style="margin-bottom:20px;",
+         div(class="ct", qs()[[i]]),
+         textAreaInput(paste0("q",i),NULL,value="",rows=3,
+           placeholder="Your answer…", width="100%"))
+     ))
+   )
+ })
+ 
+ observeEvent(input$submit_q, {
+   output$q_thanks <- renderText(
+     paste0("Thank you, ",input$name,"! Your feedback has been recorded on ",Sys.Date(),
+            ".\nYour responses help us improve personalised cardiovascular care."))
+ })
+}
+ 
+# ─── LAUNCH ────────────────────────────────────────────────────────────────────
+shinyApp(ui=ui, server=server)
 
-Do you want to proceed? [Y/n]: Y
-
-# Installing packages ------------------------------------------------
-- Installing shiny ...                          OK [linked from cache]
-Successfully installed 1 package in 21 milliseconds.
-> install.packages("plotly")
-The following package(s) will be installed:
-- plotly [4.10.2]
-These packages will be installed into "~/Recommender App/renv/library/R-4.3/x86_64-w64-mingw32".
-
-Do you want to proceed? [Y/n]: Y
-
-# Installing packages ------------------------------------------------
-- Installing plotly ...                         OK [linked from cache]
-Successfully installed 1 package in 22 milliseconds.
-> library(shiny)
-> library(plotly)
-> 
-> # Sample healthcare dataset with age, medical history, diagnoses, severity, effectiveness, and survival rates
-> set.seed(123)
-> n_patients <- 100
-> age <- sample(20:80, n_patients, replace = TRUE)
-> medical_history <- sample(c("None", "Heart Disease", "Diabetes", "Asthma"), n_patients, replace = TRUE)
-> diagnoses <- sample(c("Common Cold", "Influenza (Flu)", "Strep Throat", "Allergic Rhinitis", "Tension Headache"), n_patients, replace = TRUE)
-> severity <- sample(1:5, n_patients, replace = TRUE)
-> effectiveness <- sample(1:5, n_patients, replace = TRUE)
-> 
-> # Rule-based treatment recommendations (simplified)
-> recommend_treatment <- function(diagnosis, severity, effectiveness) 
-  {
-+     if (diagnosis == "Common Cold" && severity < 3) 
-      {
-+         if (effectiveness >= 3) 
-          {
-+             return("Rest and drink fluids")
-+         } 
-          else 
-          {
-+             return("Take over-the-counter medication")
-+         }
-+     }
-          else if (diagnosis == "Influenza (Flu)" && severity < 4) 
-          {
-+             if (effectiveness >= 3) 
-              {
-+             return("Take antiviral medication, Get plenty of rest")
-+         } 
-              else 
-              {
-+             return("Consult a doctor for further evaluation")
-+         }
-+         } 
-              else if (diagnosis == "Strep Throat" && severity < 3) 
-              {
-+               if (effectiveness >= 3)
-                {
-+                   return("Take antibiotics, Gargle warm saltwater")
-+               } 
-                else 
-                {
-+                   return("Consult a doctor for alternative treatment")
-+               }
-+     }
-              else 
-              {
-+                  return("Consult a doctor for personalized treatment")
-+             }
-+ }
-> calculate_survival_rate <- function(age, medical_history) {
-+     base_rate <- 0.9
-+     
-+     # Adjust survival rate based on medical history
-+     if (medical_history == "Heart Disease") 
-      {
-+         base_rate <- base_rate * 0.6
-+     } 
-      else if (medical_history == "Diabetes")
-      {
-+         base_rate <- base_rate * 0.7
-+     } 
-      else if (medical_history == "Asthma")
-      {
-+         base_rate <- base_rate * 0.8
-+     }
-+     
-+     # Adjust survival rate based on age
-+     if (age > 60) 
-      {
-+         base_rate <- base_rate * 0.85
-+     }
-+     
-+     return(base_rate)
-+ }
-> 
-> # Define the user interface with a customized title
-> ui <- fluidPage(
-+     titlePanel("Akshay Singh's Healthcare Decision Support System"),
-+     sidebarLayout(
-+         sidebarPanel(
-+             selectInput("diagnosis", "Select Diagnosis:", choices = c("Common Cold", "Influenza (Flu)", "Strep Throat")),
-+             sliderInput("severity", "Select Severity (1-5):", min = 1, max = 5, value = 3),
-+             sliderInput("effectiveness", "Select Effectiveness (1-5):", min = 1, max = 5, value = 3),
-+             selectInput("medical_history", "Select Medical History:", choices = c("None", "Heart Disease", "Diabetes", "Asthma")),
-+             actionButton("recommend_btn", "Get Recommendation", class = "btn-primary"),
-+             h4("Estimated Survival Rate:")
-+         ),
-+         mainPanel(
-+             h3("Recommendation:"),
-+             verbatimTextOutput("recommendation_output"),
-+             plotlyOutput("survival_rate_plot"),
-+             plotOutput("severity_effectiveness_plot")
-+         )
-+     )
-+ )
-> 
-> # Define the server logic
-> server <- function(input, output) {
-+     recommended_treatment <- eventReactive(input$recommend_btn, {
-+         diagnosis <- input$diagnosis
-+         severity <- input$severity
-+         effectiveness <- input$effectiveness
-+         medical_history <- input$medical_history
-+         treatment <- recommend_treatment(diagnosis, severity, effectiveness)
-+         rate <- calculate_survival_rate(sample(20:80, 1), medical_history)  # Sample age for simplicity
-+         return(list(treatment = treatment, rate = rate))
-+     })
-+     
-+ output$recommendation_output <- renderText({
-+     recommended_treatment()$treatment
-+ })
-+ 
-+ output$survival_rate_plot <- renderPlotly({
-+     rate <- recommended_treatment()$rate
-+     
-+     
-+ # Create a pie chart for survival rate
-+ data <- data.frame(Category = c("Survival", "Non-Survival"), Rate = c(rate, 1 - rate))
-+ colors <- c("#00cc00", "#ff0000")
-+ 
-+ pie_chart <- plot_ly(data, labels = ~Category, values = ~Rate, type = "pie", 
-+                      marker = list(colors = colors), textinfo = "label+percent")
-+ 
-+ pie_chart <- pie_chart %>%
-+     layout(title = "Estimated Survival Rate",
-+            showlegend = FALSE,
-+            annotations = list(text = paste0("Rate: ", scales::percent(rate)),
-+                               x = 0.5, y = 0.5, showarrow = FALSE))
-+ 
-+ pie_chart
-+ })
-+ 
-+ 
-+ output$severity_effectiveness_plot <- renderPlot({
-+     severity <- input$severity
-+     effectiveness <- input$effectiveness
-+     
-+     # Create a bar graph for severity and effectiveness
-+     data <- data.frame(Measure = c("Severity", "Effectiveness"), Value = c(severity, effectiveness))
-+     
-+     gg <- ggplot(data, aes(x = Measure, y = Value, fill = Measure)) +
-+         geom_bar(stat = "identity", width = 0.5) +
-+         labs(x = NULL, y = "Value") +
-+         theme_minimal() +
-+         theme(
-+             axis.text.x = element_text(angle = 45, hjust = 1),
-+             plot.title = element_text(hjust = 0.5)
-+         ) +
-+         ggtitle("Severity and Effectiveness")
-+     
-+     print(gg)
-+ })
-+ }
-> 
-> shinyApp(ui = ui, server = server)
